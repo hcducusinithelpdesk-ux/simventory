@@ -2,13 +2,16 @@
 //  SIM Inventory API — Cloudflare Pages Function + D1
 //  Routes (all JSON, all require Bearer token except POST /api/login):
 //    POST   /api/login            {username,password} -> {token,username,expiresAt}
-//    GET    /api/state            -> {data,brands,canEdit,protected,ver}
+//    GET    /api/summary          -> {brands:[{name,count}],total,ver,role,canEdit}
+//    GET    /api/sims?q&brand&status&sort&dir&page&size -> one page {items,total,page,pages}
+//    GET    /api/export?<filters>&after&limit  (admin) keyset-paged dump
+//    POST   /api/lookup           {numbers,sims} (admin) existing SIMs for import
 //    GET    /api/ver              -> {ver}
 //    GET    /api/log              -> {log:[...]}  (last 20 login attempts)
 //    POST   /api/sims             {number,account,simNo,brand,status}
 //    PUT    /api/sims/:id         {number,account,simNo,brand,status}
 //    DELETE /api/sims/:id
-//    POST   /api/bulk             {items:[...], brands:[...]} -> {inserted}
+//    POST   /api/bulk             {items,updates,brands} -> {inserted,updated,skipped}
 //    POST   /api/brands           {name}
 //    PUT    /api/brands/:name     {name}   (rename)
 //    DELETE /api/brands/:name     (only if no SIMs use it)
@@ -134,6 +137,55 @@ function isUniqueErr(e) {
   return /UNIQUE constraint failed/i.test(String(e && e.message));
 }
 
+// ---------- query helpers (pagination / search / filters) ----------
+const MAX_PAGE = 250;
+const EXPORT_PAGE = 2000;
+const MAX_LOOKUP = 1000;
+const ADMIN_COLS = 'id, number, account, sim_no AS simNo, brand, status';
+const VIEWER_COLS = 'id, number, account, brand, status'; // viewers never receive SIM card no.
+
+function likeEsc(s) {
+  return '%' + String(s).replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+}
+// Build WHERE clause from query params. Viewers cannot search by SIM card no.
+function buildFilter(sp, isAdmin) {
+  const conds = [], args = [];
+  const brand = clean(sp.get('brand'), 40);
+  const status = sp.get('status') === 'Active' || sp.get('status') === 'Inactive' ? sp.get('status') : '';
+  const q = clean(sp.get('q'), 60).toLowerCase();
+  if (brand) { conds.push('brand = ?'); args.push(brand); }
+  if (status) { conds.push('status = ?'); args.push(status); }
+  if (q) {
+    const ql = likeEsc(q), qn = likeEsc(norm(q) || q);
+    const parts = [
+      "lower(number) LIKE ? ESCAPE '\\'",
+      "number_norm LIKE ? ESCAPE '\\'",
+      "lower(account) LIKE ? ESCAPE '\\'",
+      "replace(replace(lower(account),' ',''),'-','') LIKE ? ESCAPE '\\'",
+      "lower(brand) LIKE ? ESCAPE '\\'",
+    ];
+    args.push(ql, qn, ql, qn, ql);
+    if (isAdmin) {
+      parts.push("lower(sim_no) LIKE ? ESCAPE '\\'", "sim_norm LIKE ? ESCAPE '\\'");
+      args.push(ql, qn);
+    }
+    conds.push('(' + parts.join(' OR ') + ')');
+  }
+  return { where: conds.length ? ' WHERE ' + conds.join(' AND ') : '', args, brand, status, hasSearch: !!q };
+}
+function sortColumn(key, isAdmin) {
+  const map = { number: 'number_norm', account: 'account', brand: 'brand', status: 'status' };
+  if (isAdmin) map.simNo = 'sim_norm';
+  return map[key] || 'number_norm';
+}
+async function dupErr(db, r, selfId) {
+  const c = await db
+    .prepare("SELECT number, brand FROM sims WHERE (number_norm = ?1 OR (?2 <> '' AND sim_norm = ?2)) AND id <> ?3 LIMIT 1")
+    .bind(norm(r.number), norm(r.simNo), selfId)
+    .first();
+  return json({ error: 'Duplicate', conflict: c || null }, 409);
+}
+
 // ---------- login ----------
 async function handleLogin(request, env) {
   const db = env.DB;
@@ -227,17 +279,42 @@ export async function onRequest(context) {
     // GET /api/ver  (all roles)
     if (res === 'ver' && method === 'GET') return json({ ver: await getVer(db) });
 
-    // GET /api/state  (all roles; viewers get only the columns they may see)
-    if (res === 'state' && method === 'GET') {
-      const cols = isAdmin
-        ? 'id, number, account, sim_no AS simNo, brand, status'
-        : 'id, number, account, brand, status'; // viewer: no SIM card no.
-      const [sims, brands, ver] = await Promise.all([
-        db.prepare('SELECT ' + cols + ' FROM sims ORDER BY created_at, id').all(),
-        db.prepare('SELECT name FROM brands ORDER BY pos, name').all(),
-        getVer(db),
-      ]);
-      return json({ data: sims.results, brands: brands.results.map((b) => b.name), canEdit: isAdmin, protected: false, role: user.role, ver, user: user.name });
+    // GET /api/summary  (all roles) — brand tabs + counts, cheap (reads brands table only)
+    if (res === 'summary' && method === 'GET') {
+      const [b, ver] = await Promise.all([db.prepare('SELECT name, cnt FROM brands ORDER BY pos, name').all(), getVer(db)]);
+      const brands = b.results.map((x) => ({ name: x.name, count: Math.max(0, x.cnt || 0) }));
+      const total = brands.reduce((s, x) => s + x.count, 0);
+      return json({ brands, total, ver, role: user.role, canEdit: isAdmin, user: user.name });
+    }
+
+    // GET /api/sims?q=&brand=&status=&sort=&dir=&page=&size=  (all roles) — one page
+    if (res === 'sims' && method === 'GET' && !id) {
+      const url = new URL(request.url);
+      const f = buildFilter(url.searchParams, isAdmin);
+      const sortCol = sortColumn(url.searchParams.get('sort'), isAdmin);
+      const dir = url.searchParams.get('dir') === 'desc' ? 'DESC' : 'ASC';
+      const size = Math.min(MAX_PAGE, Math.max(1, parseInt(url.searchParams.get('size'), 10) || 100));
+      const page = Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1);
+      const cols = isAdmin ? ADMIN_COLS : VIEWER_COLS;
+
+      // total: use maintained counters when possible (no table scan)
+      let total;
+      if (!f.hasSearch && !f.status) {
+        const r = f.brand
+          ? await db.prepare('SELECT cnt AS n FROM brands WHERE name = ?1').bind(f.brand).first()
+          : await db.prepare('SELECT COALESCE(SUM(cnt),0) AS n FROM brands').first();
+        total = r ? Math.max(0, r.n) : 0;
+      } else {
+        const r = await db.prepare('SELECT COUNT(*) AS n FROM sims' + f.where).bind(...f.args).first();
+        total = r ? r.n : 0;
+      }
+      const pages = Math.max(1, Math.ceil(total / size));
+      const p = Math.min(page, pages);
+      const rows = await db
+        .prepare('SELECT ' + cols + ' FROM sims' + f.where + ' ORDER BY ' + sortCol + ' ' + dir + ', id ' + dir + ' LIMIT ? OFFSET ?')
+        .bind(...f.args, size, (p - 1) * size)
+        .all();
+      return json({ items: rows.results, total, page: p, pages, size, ver: await getVer(db) });
     }
 
     // ---------- everything below is admin-only ----------
@@ -302,21 +379,51 @@ export async function onRequest(context) {
       return json({ log: r.results.map((x) => ({ ...x, success: !!x.success })) });
     }
 
-    // /api/sims
+    // GET /api/export?<filters>&after=<id>&limit=  — keyset-paged full dump for CSV / backup
+    if (res === 'export' && method === 'GET') {
+      const url = new URL(request.url);
+      const f = buildFilter(url.searchParams, true);
+      const limit = Math.min(EXPORT_PAGE, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || EXPORT_PAGE));
+      const after = url.searchParams.get('after') || '';
+      const where = f.where ? f.where + ' AND id > ?' : ' WHERE id > ?';
+      const rows = await db
+        .prepare('SELECT ' + ADMIN_COLS + ' FROM sims' + where + ' ORDER BY id LIMIT ?')
+        .bind(...f.args, after, limit)
+        .all();
+      const items = rows.results;
+      return json({ items, next: items.length === limit ? items[items.length - 1].id : null });
+    }
+
+    // POST /api/lookup {numbers:[...], sims:[...]} — find existing SIMs for import preview
+    if (res === 'lookup' && method === 'POST') {
+      const b = await body(request);
+      const nums = (Array.isArray(b.numbers) ? b.numbers : []).map(norm).filter(Boolean).slice(0, MAX_LOOKUP);
+      const sims = (Array.isArray(b.sims) ? b.sims : []).map(norm).filter(Boolean).slice(0, MAX_LOOKUP);
+      const r = await db
+        .prepare(
+          'SELECT ' + ADMIN_COLS + ', number_norm AS numberNorm, sim_norm AS simNorm FROM sims ' +
+            'WHERE number_norm IN (SELECT value FROM json_each(?1)) ' +
+            "OR (sim_norm <> '' AND sim_norm IN (SELECT value FROM json_each(?2)))"
+        )
+        .bind(JSON.stringify(nums), JSON.stringify(sims))
+        .all();
+      return json({ items: r.results });
+    }
+
+    // /api/sims (write)
     if (res === 'sims') {
       if (method === 'POST' && !id) {
         const r = cleanRec(await body(request));
         if (!r.number || !r.brand) return err(400, 'Kailangan ang Mobile No. at Brand.');
         try {
           await db.batch([
-            ensureBrand(db, r.brand),
             db
               .prepare('INSERT INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)')
               .bind(uid(), r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status),
             bumpVer(db),
           ]);
         } catch (e) {
-          if (isUniqueErr(e)) return err(409, 'Duplicate');
+          if (isUniqueErr(e)) return dupErr(db, r, '');
           throw e;
         }
         return json({ ok: true });
@@ -327,17 +434,16 @@ export async function onRequest(context) {
         let out;
         try {
           out = await db.batch([
-            ensureBrand(db, r.brand),
             db
               .prepare("UPDATE sims SET number=?2, number_norm=?3, account=?4, sim_no=?5, sim_norm=?6, brand=?7, status=?8, updated_at=datetime('now') WHERE id=?1")
               .bind(id, r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status),
             bumpVer(db),
           ]);
         } catch (e) {
-          if (isUniqueErr(e)) return err(409, 'Duplicate');
+          if (isUniqueErr(e)) return dupErr(db, r, id);
           throw e;
         }
-        if (!out[1].meta.changes) return err(404, 'Hindi nahanap ang SIM.');
+        if (!out[0].meta.changes) return err(404, 'Hindi nahanap ang SIM.');
         return json({ ok: true });
       }
       if (method === 'DELETE' && id) {
@@ -347,29 +453,39 @@ export async function onRequest(context) {
       }
     }
 
-    // POST /api/bulk
+    // POST /api/bulk {items:[new...], updates:[{id,...}], brands:[...]} -> {inserted, updated, skipped}
     if (res === 'bulk' && method === 'POST') {
       const b = await body(request);
-      const items = Array.isArray(b.items) ? b.items.slice(0, MAX_BULK) : [];
+      const items = (Array.isArray(b.items) ? b.items : []).slice(0, MAX_BULK).map(cleanRec).filter((r) => r.number && r.brand);
+      const updates = (Array.isArray(b.updates) ? b.updates : [])
+        .slice(0, MAX_BULK)
+        .map((u) => ({ id: clean(u.id, 40), ...cleanRec(u) }))
+        .filter((u) => u.id && u.number && u.brand);
       const newBrands = Array.isArray(b.brands) ? b.brands.map((x) => clean(x, 40)).filter(Boolean) : [];
-      const stmts = [];
-      const brandSet = new Set(newBrands);
-      const recs = items.map(cleanRec).filter((r) => r.number && r.brand);
-      recs.forEach((r) => brandSet.add(r.brand));
-      brandSet.forEach((name) => stmts.push(ensureBrand(db, name)));
-      const firstSim = stmts.length;
-      recs.forEach((r) => {
+      const stmts = newBrands.map((name) => ensureBrand(db, name));
+      const firstIns = stmts.length;
+      items.forEach((r) =>
         stmts.push(
           db
-            .prepare('INSERT OR IGNORE INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)')
+            .prepare('INSERT OR IGNORE INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) RETURNING id')
             .bind(uid(), r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status)
-        );
-      });
+        )
+      );
+      const firstUpd = stmts.length;
+      updates.forEach((u) =>
+        stmts.push(
+          db
+            .prepare("UPDATE OR IGNORE sims SET number=?2, number_norm=?3, account=?4, sim_no=?5, sim_norm=?6, brand=?7, status=?8, updated_at=datetime('now') WHERE id=?1 RETURNING id")
+            .bind(u.id, u.number, norm(u.number), u.account, u.simNo, norm(u.simNo), u.brand, u.status)
+        )
+      );
       stmts.push(bumpVer(db));
       const out = await db.batch(stmts);
-      let inserted = 0;
-      for (let i = firstSim; i < firstSim + recs.length; i++) inserted += out[i].meta.changes || 0;
-      return json({ inserted, skipped: recs.length - inserted });
+      let inserted = 0, updated = 0;
+      // count via RETURNING rows — meta.changes also includes rows touched by the counter triggers
+      for (let i = firstIns; i < firstUpd; i++) inserted += (out[i].results || []).length;
+      for (let i = firstUpd; i < firstUpd + updates.length; i++) updated += (out[i].results || []).length;
+      return json({ inserted, updated, skipped: items.length - inserted + (updates.length - updated) });
     }
 
     // /api/brands
@@ -385,19 +501,23 @@ export async function onRequest(context) {
       if (method === 'PUT' && id) {
         const name = clean((await body(request)).name, 40);
         if (!name) return err(400, 'Kailangan ang bagong pangalan.');
+        const old = await db.prepare('SELECT pos FROM brands WHERE name = ?1').bind(id).first();
+        if (!old) return err(404, 'Walang ganitong brand.');
         const clash = await db.prepare('SELECT 1 FROM brands WHERE lower(name) = lower(?1) AND name <> ?2').bind(name, id).first();
         if (clash) return err(409, 'Mayroon nang brand na ganito ang pangalan.');
-        const out = await db.batch([
-          db.prepare('UPDATE brands SET name = ?2 WHERE name = ?1').bind(id, name),
+        if (name === id) return json({ ok: true });
+        // create new brand row at the same position, move SIMs (triggers move the counts), drop old row
+        await db.batch([
+          db.prepare('INSERT INTO brands (name, pos, cnt) VALUES (?1, ?2, 0)').bind(name, old.pos),
           db.prepare("UPDATE sims SET brand = ?2, updated_at = datetime('now') WHERE brand = ?1").bind(id, name),
+          db.prepare('DELETE FROM brands WHERE name = ?1').bind(id),
           bumpVer(db),
         ]);
-        if (!out[0].meta.changes) return err(404, 'Walang ganitong brand.');
         return json({ ok: true });
       }
       if (method === 'DELETE' && id) {
-        const used = await db.prepare('SELECT COUNT(*) AS n FROM sims WHERE brand = ?1').bind(id).first();
-        if (used && used.n > 0) return err(409, 'May SIM pa sa brand na ito.');
+        const used = await db.prepare('SELECT cnt FROM brands WHERE name = ?1').bind(id).first();
+        if (used && used.cnt > 0) return err(409, 'May SIM pa sa brand na ito.');
         await db.batch([db.prepare('DELETE FROM brands WHERE name = ?1').bind(id), bumpVer(db)]);
         return json({ ok: true });
       }

@@ -17,7 +17,8 @@ CREATE INDEX IF NOT EXISTS ix_sims_brand ON sims(brand);
 
 CREATE TABLE IF NOT EXISTS brands (
   name TEXT PRIMARY KEY,
-  pos  INTEGER NOT NULL DEFAULT 0
+  pos  INTEGER NOT NULL DEFAULT 0,
+  cnt  INTEGER NOT NULL DEFAULT 0   -- number of SIMs, maintained by triggers below
 );
 
 -- data version counter (used by clients to auto-refresh)
@@ -57,3 +58,25 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 INSERT OR IGNORE INTO brands (name, pos) VALUES ('Globe', 1), ('Smart', 2);
+
+-- per-brand counters + search/sort indexes (see migrations/002_scalability.sql)
+CREATE TRIGGER IF NOT EXISTS trg_sims_ai AFTER INSERT ON sims BEGIN
+  INSERT OR IGNORE INTO brands (name, pos) VALUES (NEW.brand, (SELECT COALESCE(MAX(pos),0)+1 FROM brands));
+  UPDATE brands SET cnt = cnt + 1 WHERE name = NEW.brand;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_sims_ad AFTER DELETE ON sims BEGIN
+  UPDATE brands SET cnt = cnt - 1 WHERE name = OLD.brand;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_sims_au_brand AFTER UPDATE OF brand ON sims WHEN OLD.brand <> NEW.brand BEGIN
+  UPDATE brands SET cnt = cnt - 1 WHERE name = OLD.brand;
+  INSERT OR IGNORE INTO brands (name, pos) VALUES (NEW.brand, (SELECT COALESCE(MAX(pos),0)+1 FROM brands));
+  UPDATE brands SET cnt = cnt + 1 WHERE name = NEW.brand;
+END;
+
+CREATE INDEX IF NOT EXISTS ix_sims_status       ON sims(status);
+CREATE INDEX IF NOT EXISTS ix_sims_brand_status ON sims(brand, status);
+CREATE INDEX IF NOT EXISTS ix_sims_brand_number ON sims(brand, number_norm);
+CREATE INDEX IF NOT EXISTS ix_sims_account      ON sims(account);
+

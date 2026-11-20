@@ -67,19 +67,37 @@ All routes need the Bearer token except login.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/login` | `{username,password}` → `{token,username,expiresAt}` |
-| GET | `/api/state` | all SIMs + brands + version |
-| GET | `/api/ver` | data version (frontend polls every 30s to auto-refresh) |
+| GET | `/api/summary` | brands + per-brand counts + total + role (reads only the small `brands` table) |
+| GET | `/api/sims?q&brand&status&sort&dir&page&size` | **one page** of SIMs (size ≤ 250), filtered/sorted in SQL |
+| GET | `/api/ver` | data version (frontend polls every 30s; reloads summary + current page only when it changes) |
+| GET | `/api/export?<filters>&after&limit` | keyset-paged dump, 2000/request (admin; CSV export + backup) |
+| POST | `/api/lookup` | `{numbers,sims}` → which already exist (admin; import preview, 1000/request) |
 | GET | `/api/log` | last 20 login attempts (admin) |
 | GET / POST | `/api/users` | list / create users (admin) |
 | PUT / DELETE | `/api/users/:username` | change role/password/active, delete (admin) |
 | POST | `/api/sims` | add SIM (409 if mobile no. or SIM no. already exists) |
 | PUT / DELETE | `/api/sims/:id` | edit / delete SIM |
-| POST | `/api/bulk` | import up to 500 SIMs (duplicates skipped) |
+| POST | `/api/bulk` | `{items,updates,brands}` up to 500 inserts + 500 updates per request (duplicates skipped) |
 | POST | `/api/brands` | add brand |
 | PUT / DELETE | `/api/brands/:name` | rename / delete brand (delete only if unused) |
 | POST | `/api/clear` | delete everything (used by Restore) |
 
 Uniqueness is enforced by the DB on normalized mobile no. and SIM no. (spaces/dashes removed).
+
+### Scalability design
+- The browser never downloads the whole table: it loads `/api/summary` (tabs/counts) + one page from `/api/sims`.
+- **Per-brand counts** live in `brands.cnt`, maintained by triggers `trg_sims_ai`, `trg_sims_ad`, `trg_sims_au_brand` — so tab counts and unfiltered totals cost no table scan. Never update `brands.cnt` by hand; brand rename moves SIMs via `UPDATE sims` so the triggers move the counts.
+- Indexes: unique `number_norm`, unique `sim_norm`, plus `brand`, `status`, `(brand,status)`, `(brand,number_norm)`, `account`.
+- Search uses `LIKE '%…%'` (substring match on mobile/account/brand, and SIM no. for admins only), which scans rows. Search is debounced (350 ms). Fine for tens of thousands of rows; for millions, add D1 FTS5.
+- Export/backup use keyset pagination (`id > after`), so they stay fast on big tables.
+- Bulk counts use `RETURNING id` (D1 `meta.changes` also counts rows touched by triggers).
+- Tested locally with 20,000 SIMs: page load ~10 ms, search ~50–80 ms, full export ~0.2 s.
+- D1 free plan has daily read/write limits; for heavy use, the Workers Paid plan ($5/month) raises them a lot. Check current limits on Cloudflare's pricing page.
+
+### Migrations
+`schema.sql` = full schema for a new database. Changes to an existing DB go in `migrations/` and are run once:
+`npx wrangler d1 execute sim-inventory-db --remote --file=migrations/<file>.sql`
+(`002_scalability.sql` was applied to production on 2026-11-20.)
 
 ---
 

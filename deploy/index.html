@@ -49,6 +49,8 @@
   td.n{color:var(--muted);width:40px}
   tr:hover td{background:#fafbff}
   .empty{padding:40px;text-align:center;color:var(--muted)}
+  .pager{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap;margin:10px 0;font-size:13px;color:var(--muted)}
+  .pager #pgInfo{min-width:90px;text-align:center}
   dialog{border:none;border-radius:12px;padding:0;width:min(460px,95vw);box-shadow:0 10px 40px rgba(0,0,0,.3)}
   dialog.wide{width:min(680px,95vw)}
   dialog::backdrop{background:rgba(0,0,0,.45)}
@@ -68,6 +70,7 @@
   body.ro .edit-only{display:none!important}
   /* Viewer role: only Mobile No. + Account No. columns */
   body.ro .col-adm{display:none!important}
+  body.ro .tablewrap table{min-width:0}
   .role-tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;opacity:.85;margin-left:4px}
   #usersDlg table{min-width:0;font-size:13px}
   #usersDlg th,#usersDlg td{padding:7px 10px;cursor:default}
@@ -75,7 +78,7 @@
   .uform{display:grid;grid-template-columns:1fr 1fr 130px auto;gap:8px;align-items:end;margin-top:12px}
   .uform label{margin:0 0 3px}
   @media (max-width:600px){.uform{grid-template-columns:1fr}}
-  @media print{header,.tabs .tab:not(.active),.toolbar,.note,.drop,td.act,th.act,#addBrand{display:none}}
+  @media print{header,.tabs .tab:not(.active),.toolbar,.note,.drop,td.act,th.act,#addBrand,.pager{display:none}}
 
   /* ========== Login Page Styles ========== */
   #loginOverlay{
@@ -249,6 +252,16 @@
       </thead>
       <tbody id="tbody"></tbody>
     </table>
+  </div>
+  <div class="pager" id="pager">
+    <button type="button" class="sm" id="pgFirst" title="Unang page">«</button>
+    <button type="button" class="sm" id="pgPrev">‹ Prev</button>
+    <span id="pgInfo">Page 1 / 1</span>
+    <button type="button" class="sm" id="pgNext">Next ›</button>
+    <button type="button" class="sm" id="pgLast" title="Huling page">»</button>
+    <select id="pgSize" title="Rows per page" style="width:auto;padding:4px 8px;font-size:12px">
+      <option value="50">50 / page</option><option value="100">100 / page</option><option value="250">250 / page</option>
+    </select>
   </div>
 
   <p class="note" id="noteTxt">
@@ -869,13 +882,20 @@ function initApp(){
     th.textContent='Brand';
   });
 
-  var KEY='sim_inventory_v2', BKEY='sim_brands_v2';
-  var data=[], brands=[], tab='__all', statusFilter='__all', brandFilter='__all', sortKey='number', sortDir=1, editId=null;
-  var ONLINE=document.documentElement.getAttribute('data-mode')==='online', canEdit=true, protectedMode=false, curVer=null;
+  // ------------------------------------------------------------
+  //  State. Data lives on the server (D1); the browser only holds
+  //  the current page of rows + the brand list/counts.
+  // ------------------------------------------------------------
+  var KEY='sim_inventory_v2', BKEY='sim_brands_v2'; // old offline storage (used only for one-time migration)
+  var PAGE_SIZES=[50,100,250];
+  var data=[], brands=[], brandCounts={}, totalAll=0;
+  var tab='__all', statusFilter='__all', brandFilter='__all', sortKey='number', sortDir=1, editId=null;
+  var page=1, pages=1, pageSize=100, totalRows=0, loadSeq=0;
+  var canEdit=false, curVer=null;
   var pending=null, lossy=false;
+  try{var ps=parseInt(localStorage.getItem('sim_page_size'),10);if(PAGE_SIZES.indexOf(ps)>=0)pageSize=ps}catch(e){}
 
   function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-  function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
   function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
   function norm(s){return String(s||'').replace(/[\s-]/g,'').toLowerCase()}
   function normalizeStatus(s){
@@ -886,67 +906,92 @@ function initApp(){
     return String(s||'').trim().toLowerCase()==='fire'?'Brand':s;
   }
   function read(k){try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}}
-  function save(){try{localStorage.setItem(KEY,JSON.stringify(data));localStorage.setItem(BKEY,JSON.stringify(brands))}catch(e){alert('Hindi ma-save ang data sa browser. Mag-Backup (JSON) agad.')}}
 
-  // ---------- online mode (Cloudflare) ----------
+  // ---------- server API ----------
   async function api(method,path,body){
     var h={'Content-Type':'application/json'},s=getSession();
     if(s&&s.token)h['Authorization']='Bearer '+s.token;
     var res=await fetch(path,{method:method,headers:h,body:body?JSON.stringify(body):undefined,cache:'no-store'});
     var j={};try{j=await res.json()}catch(e){}
     if(res.status===401){performLogout('Session expired. Please sign in again.')}
-    if(!res.ok){var err=new Error(j.error||('Error '+res.status));err.status=res.status;throw err}
+    if(!res.ok){var err=new Error(j.error||('Error '+res.status));err.status=res.status;err.conflict=j.conflict;throw err}
     return j;
   }
   function errMsg(e){
     if(e&&e.status===401)return 'Nag-expire ang session. Mag-login ulit.';
     if(e&&e.status===403)return 'Bawal: pang-administrator lang ito. Viewer ang account mo.';
-    if(e&&e.status===409)return 'May kapareho na ang Mobile No. o SIM Card No. na ito.';
+    if(e&&e.status===409&&e.conflict)return 'May kapareho na ang Mobile No. o SIM Card No. na ito ('+e.conflict.number+' - '+e.conflict.brand+').';
+    if(e&&e.status===409)return e.message&&e.message!=='Duplicate'?e.message:'May kapareho na ang Mobile No. o SIM Card No. na ito.';
     return (e&&e.message)||'May error. Subukan ulit.';
   }
   function applyMode(){
-    document.body.classList.toggle('ro',ONLINE&&!canEdit);
+    document.body.classList.toggle('ro',!canEdit);
     $('modeTxt').textContent='🌐 Online • Shared database'+(canEdit?'':' • View-only');
     $('q').placeholder=canEdit?'Hanapin: mobile no., account no., SIM card no....':'Hanapin: mobile no. o account no....';
-    var bl=$('btnLogin');if(bl){bl.hidden=!protectedMode;
-    bl.textContent=canEdit?'🔓 Logout':'🔒 Login para mag-edit';}
-  }
-  async function loadRemote(){
-    var j=await api('GET','/api/state');
-    data=j.data||[];brands=j.brands||[];canEdit=!!j.canEdit;protectedMode=!!j.protected;curVer=j.ver;
-    if(tab!=='__all'&&brands.indexOf(tab)===-1)tab='__all';
-    applyMode();render();
-  }
-  async function bulkSend(items,newBrands){
-    var i,inserted=0;
-    for(i=0;i<Math.max(items.length,1);i+=200){
-      var r=await api('POST','/api/bulk',{items:items.slice(i,i+200),brands:i===0?newBrands:[]});
-      inserted+=r.inserted||0;
-    }
-    return inserted;
   }
 
-  // ---------- load ----------
-  (function init(){
-    if(ONLINE)return;
-    var d=read(KEY), b=read(BKEY);
-    if(Array.isArray(d)){data=d}
-    else{
-      var old=read('sim_inventory_v1');
-      if(Array.isArray(old)){
-        data=old.map(function(r){return {id:r.id||uid(),number:r.number||'',account:'',simNo:r.iccid||'',brand:r.carrier||'Globe',status:'Active'}});
-      }
+  // current filters -> query string (shared by page loads and exports)
+  function filterParams(){
+    var p=new URLSearchParams();
+    var q=$('q').value.trim();if(q)p.set('q',q);
+    var b=tab!=='__all'?tab:(brandFilter!=='__all'?brandFilter:'');
+    if(b)p.set('brand',b);
+    if(statusFilter!=='__all')p.set('status',statusFilter);
+    return p;
+  }
+  function filterConflict(){return tab!=='__all'&&brandFilter!=='__all'&&tab!==brandFilter}
+
+  async function loadSummary(){
+    var j=await api('GET','/api/summary');
+    brands=(j.brands||[]).map(function(b){return b.name});
+    brandCounts={};(j.brands||[]).forEach(function(b){brandCounts[b.name]=b.count});
+    totalAll=j.total||0;canEdit=!!j.canEdit;curVer=j.ver;
+    if(tab!=='__all'&&brands.indexOf(tab)===-1)tab='__all';
+    applyMode();renderTabs();updateFilterOptions();
+  }
+  async function loadPage(){
+    var seq=++loadSeq;
+    if(filterConflict()){data=[];totalRows=0;pages=1;page=1;renderRows();return}
+    var p=filterParams();
+    p.set('sort',sortKey);p.set('dir',sortDir>0?'asc':'desc');p.set('page',page);p.set('size',pageSize);
+    var j=await api('GET','/api/sims?'+p.toString());
+    if(seq!==loadSeq)return; // a newer request already started; ignore this stale response
+    data=j.items||[];totalRows=j.total||0;page=j.page||1;pages=j.pages||1;
+    renderRows();
+  }
+  async function loadRemote(){await loadSummary();await loadPage()}
+  function showLoadErr(e){
+    if(e&&e.status===401)return;
+    $('tbody').innerHTML='<tr><td colspan="7" class="empty">Hindi ma-load ang data: '+esc(e&&e.message)+'</td></tr>';
+  }
+  function refreshPage(resetPage){if(resetPage)page=1;return loadPage().catch(showLoadErr)}
+  var searchTimer=null;
+  function refreshSoon(){clearTimeout(searchTimer);searchTimer=setTimeout(function(){refreshPage(true)},350)}
+
+  // send inserts/updates in chunks (server accepts up to 500 of each per request)
+  async function bulkSend(items,newBrands,updates,onProgress){
+    var CH=200,i,inserted=0,updated=0,done=0;updates=updates||[];
+    var total=items.length+updates.length;
+    for(i=0;i<Math.max(items.length,updates.length,1);i+=CH){
+      var r=await api('POST','/api/bulk',{items:items.slice(i,i+CH),updates:updates.slice(i,i+CH),brands:i===0?(newBrands||[]):[]});
+      inserted+=r.inserted||0;updated+=r.updated||0;
+      done=Math.min(total,done+items.slice(i,i+CH).length+updates.slice(i,i+CH).length);
+      if(onProgress)onProgress(done,total);
     }
-    data.forEach(function(r){
-      r.status=normalizeStatus(r.status);
-      r.brand=normalizeLegacyBrandName(r.brand);
-    });
-    brands=Array.isArray(b)&&b.length?b:['Globe','Smart'];
-    brands=brands.map(normalizeLegacyBrandName);
-    brands=brands.filter(function(br,i){return brands.indexOf(br)===i});
-    data.forEach(function(r){if(r.brand&&brands.indexOf(r.brand)===-1)brands.push(r.brand)});
-    save();
-  })();
+    return {inserted:inserted,updated:updated};
+  }
+  // fetch every matching SIM in pages of 2000 (keyset pagination -> stays fast on big tables)
+  async function exportAll(params,onProgress){
+    var out=[],after='';
+    for(;;){
+      var p=new URLSearchParams(params);p.set('limit','2000');if(after)p.set('after',after);
+      var j=await api('GET','/api/export?'+p.toString());
+      out=out.concat(j.items||[]);
+      if(onProgress)onProgress(out.length);
+      if(!j.next)break;after=j.next;
+    }
+    return out;
+  }
 
   // ---------- mobile number helpers ----------
   function validMobile(s){
@@ -960,7 +1005,7 @@ function initApp(){
   }
   function fmtMobile(m){return m.slice(0,4)+' '+m.slice(4,7)+' '+m.slice(7)}
 
-  // ---------- render ----------
+  // ---------- brands ----------
   function updateFilterOptions(){
     var el=$('filterBrand');
     if(!el)return;
@@ -971,7 +1016,6 @@ function initApp(){
     el.value=brands.indexOf(value)>=0?value:'__all';
     if(el.value!==value)brandFilter='__all';
   }
-
   function renameBrand(){
     if(!canEdit)return;
     var oldName=tab!=='__all'?tab:(brandFilter!=='__all'?brandFilter:null);
@@ -988,22 +1032,16 @@ function initApp(){
       alert('Mayroon nang brand na ganito ang pangalan.');
       return;
     }
-    if(ONLINE){
-      api('PUT','/api/brands/'+encodeURIComponent(oldName),{name:newName})
-        .then(function(){tab=newName;brandFilter='__all';return loadRemote()})
-        .catch(function(e){alert(errMsg(e))});
-      return;
-    }
-    data.forEach(function(r){if(r.brand===oldName)r.brand=newName});
-    brands=brands.map(function(b){return b===oldName?newName:b});
-    tab=newName;brandFilter='__all';save();render();
+    api('PUT','/api/brands/'+encodeURIComponent(oldName),{name:newName})
+      .then(function(){tab=newName;brandFilter='__all';page=1;return loadRemote()})
+      .catch(function(e){alert(errMsg(e))});
   }
   $('btnRenameBrand').onclick=renameBrand;
 
   function renderTabs(){
-    var html='<div class="tab'+(tab==='__all'?' active':'')+'" data-t="__all">Lahat <span class="c">'+data.length+'</span></div>';
+    var html='<div class="tab'+(tab==='__all'?' active':'')+'" data-t="__all">Lahat <span class="c">'+totalAll+'</span></div>';
     brands.forEach(function(b){
-      var n=data.filter(function(r){return r.brand===b}).length;
+      var n=brandCounts[b]||0;
       html+='<div class="tab'+(tab===b?' active':'')+'" data-t="'+esc(b)+'">'+esc(b)+' <span class="c">'+n+'</span>'+(n===0&&canEdit?' <span class="x" data-x="'+esc(b)+'" title="Tanggalin ang brand">×</span>':'')+'</div>';
     });
     if(canEdit)html+='<button id="addBrand" class="sm">+ Brand</button>';
@@ -1011,68 +1049,34 @@ function initApp(){
     Array.prototype.forEach.call($('tabs').querySelectorAll('.tab'),function(el){
       el.onclick=function(e){
         if(e.target.getAttribute('data-x')){removeBrand(e.target.getAttribute('data-x'));return}
-        tab=el.getAttribute('data-t');render();
+        tab=el.getAttribute('data-t');renderTabs();refreshPage(true);
       };
     });
     if($('addBrand'))$('addBrand').onclick=function(){
       var n=(prompt('Pangalan ng bagong brand (hal. DITO, TNT):')||'').trim();
       if(!n)return;
       if(brands.some(function(b){return b.toLowerCase()===n.toLowerCase()})){alert('Nandiyan na ang brand na iyon.');return}
-      if(ONLINE){api('POST','/api/brands',{name:n}).then(loadRemote).then(function(){tab=n;render()}).catch(function(e){alert(errMsg(e))});return}
-      brands.push(n);save();tab=n;render();
+      api('POST','/api/brands',{name:n}).then(function(){tab=n;page=1;return loadRemote()}).catch(function(e){alert(errMsg(e))});
     };
   }
   function removeBrand(b){
     if(confirm('Tanggalin ang brand "'+b+'"? (Walang SIM dito)')){
-      if(ONLINE){api('DELETE','/api/brands/'+encodeURIComponent(b)).then(loadRemote).catch(function(e){alert(errMsg(e))});return}
-      brands=brands.filter(function(x){return x!==b});
-      if(tab===b)tab='__all';
-      save();render();
+      api('DELETE','/api/brands/'+encodeURIComponent(b)).then(function(){if(tab===b)tab='__all';return loadRemote()}).catch(function(e){alert(errMsg(e))});
     }
   }
-  // Normalize legacy "FIRE" brand -> "Brand" on every render (no refresh needed)
-  function normalizeAll(){
-    var changed=false;
-    data.forEach(function(r){
-      var b=normalizeLegacyBrandName(r.brand);
-      if(b!==r.brand){r.brand=b;changed=true}
-    });
-    var nb=brands.map(normalizeLegacyBrandName).filter(function(x,i,a){return a.indexOf(x)===i});
-    if(nb.length!==brands.length||nb.some(function(x,i){return x!==brands[i]})){brands=nb;changed=true}
-    data.forEach(function(r){if(r.brand&&brands.indexOf(r.brand)===-1){brands.push(r.brand);changed=true}});
-    if(tab!=='__all'){var t=normalizeLegacyBrandName(tab);if(t!==tab)tab=t}
-    if(brandFilter!=='__all'){var f=normalizeLegacyBrandName(brandFilter);if(f!==brandFilter)brandFilter=f}
-    Array.prototype.forEach.call(document.querySelectorAll('th[data-k="brand"]'),function(th){
-      if(th.textContent!=='Brand')th.textContent='Brand';
-    });
-    if(changed&&!ONLINE)save();
-  }
-  function render(){
-    normalizeAll();
-    renderTabs();
-    updateFilterOptions();
-    var q=$('q').value.trim().toLowerCase();
-    var rows=data.filter(function(r){
-      if(tab!=='__all'&&r.brand!==tab)return false;
-      if(brandFilter!=='__all'&&r.brand!==brandFilter)return false;
-      if(statusFilter!=='__all'&&normalizeStatus(r.status)!==statusFilter)return false;
-      if(q){
-        var hay=[r.number,r.account,r.simNo,r.brand,r.status].join(' ').toLowerCase();
-        if(hay.indexOf(q)===-1&&hay.replace(/[\s-]/g,'').indexOf(q.replace(/[\s-]/g,''))===-1)return false;
-      }
-      return true;
-    });
-    rows.sort(function(a,b){
-      var x=String(a[sortKey]||'').toLowerCase(),y=String(b[sortKey]||'').toLowerCase();
-      return x<y?-sortDir:x>y?sortDir:0;
-    });
-    $('count').textContent='Ipinapakita: '+rows.length+' / '+data.length;
-    if(!rows.length){
-      $('tbody').innerHTML='<tr><td colspan="7" class="empty">Walang SIM na nakita. I-drop ang Excel file sa taas o i-click ang "+ Add SIM".</td></tr>';
+
+  // ---------- table + pager ----------
+  function render(){renderTabs();updateFilterOptions();renderRows()}
+  function renderRows(){
+    var from=totalRows?(page-1)*pageSize+1:0, to=(page-1)*pageSize+data.length;
+    $('count').textContent='Ipinapakita: '+from+'–'+to+' ng '+totalRows+(totalRows!==totalAll?' (kabuuan: '+totalAll+')':'');
+    renderPager();
+    if(!data.length){
+      $('tbody').innerHTML='<tr><td colspan="7" class="empty">'+(totalAll?'Walang SIM na tumugma sa search/filter.':'Walang SIM na nakita. I-drop ang Excel file sa taas o i-click ang "+ Add SIM".')+'</td></tr>';
       return;
     }
-    $('tbody').innerHTML=rows.map(function(r,i){
-      return '<tr><td class="n">'+(i+1)+'</td>'+
+    $('tbody').innerHTML=data.map(function(r,i){
+      return '<tr><td class="n">'+(from+i)+'</td>'+
         '<td>'+esc(r.account)+'</td>'+
         '<td><b>'+esc(r.number)+'</b></td>'+
         '<td class="col-adm">'+esc(r.simNo)+'</td>'+
@@ -1083,11 +1087,27 @@ function initApp(){
     Array.prototype.forEach.call(document.querySelectorAll('[data-e]'),function(b){b.onclick=function(){openForm(b.getAttribute('data-e'))}});
     Array.prototype.forEach.call(document.querySelectorAll('[data-d]'),function(b){b.onclick=function(){del(b.getAttribute('data-d'))}});
   }
+  function renderPager(){
+    $('pgInfo').textContent='Page '+page+' / '+pages;
+    $('pgFirst').disabled=$('pgPrev').disabled=page<=1;
+    $('pgNext').disabled=$('pgLast').disabled=page>=pages;
+    $('pgSize').value=String(pageSize);
+  }
+  $('pgFirst').onclick=function(){if(page>1){page=1;refreshPage()}};
+  $('pgPrev').onclick=function(){if(page>1){page--;refreshPage()}};
+  $('pgNext').onclick=function(){if(page<pages){page++;refreshPage()}};
+  $('pgLast').onclick=function(){if(page<pages){page=pages;refreshPage()}};
+  $('pgSize').onchange=function(){
+    pageSize=parseInt(this.value,10)||100;
+    try{localStorage.setItem('sim_page_size',String(pageSize))}catch(e){}
+    refreshPage(true);
+  };
 
   // ---------- add / edit form ----------
   function openForm(id){
     editId=id||null;
     var r=id?data.filter(function(x){return x.id===id})[0]:{brand:(tab!=='__all'?tab:brands[0])};
+    if(!r)return;
     $('dlgTitle').textContent=id?'Edit SIM':'Add SIM';
     $('brand').innerHTML=brands.map(function(b){return '<option>'+esc(b)+'</option>'}).join('');
     $('brand').value=r.brand||brands[0];
@@ -1104,43 +1124,27 @@ function initApp(){
     var num=$('number').value.trim(), m=validMobile(num);
     var rec={brand:$('brand').value,number:m?fmtMobile(m):num,account:$('account').value.trim(),simNo:$('simNo').value.trim(),status:normalizeStatus($('status').value)};
     if(!rec.number){alert('Kailangan ang Mobile No.');return}
-    var dup=data.filter(function(x){
-      if(x.id===editId)return false;
-      return norm(x.number)===norm(rec.number)||(rec.simNo&&norm(x.simNo)===norm(rec.simNo));
-    })[0];
-    if(dup){alert('May kapareho na ang Mobile No. o SIM Card No. na ito ('+dup.number+' - '+dup.brand+').');return}
-    if(ONLINE){
-      try{
-        if(editId)await api('PUT','/api/sims/'+encodeURIComponent(editId),rec);
-        else await api('POST','/api/sims',rec);
-        await loadRemote();$('dlg').close();
-      }catch(err){alert(errMsg(err))}
-      return;
-    }
-    if(editId){data=data.map(function(x){return x.id===editId?Object.assign({},x,rec):x})}
-    else{rec.id=uid();data.push(rec)}
-    save();$('dlg').close();render();
+    if(!rec.brand){alert('Gumawa muna ng brand (+ Brand).');return}
+    try{
+      if(editId)await api('PUT','/api/sims/'+encodeURIComponent(editId),rec);
+      else await api('POST','/api/sims',rec);
+      $('dlg').close();
+      await loadRemote();
+    }catch(err){alert(errMsg(err))}
   };
   function del(id){
     var r=data.filter(function(x){return x.id===id})[0];
     if(r&&confirm('I-delete ang '+r.number+'? Hindi na ito mababawi (maliban kung may backup).')){
-      if(ONLINE){api('DELETE','/api/sims/'+encodeURIComponent(id)).then(loadRemote).catch(function(e){alert(errMsg(e))});return}
-      data=data.filter(function(x){return x.id!==id});save();render();
+      api('DELETE','/api/sims/'+encodeURIComponent(id)).then(loadRemote).catch(function(e){alert(errMsg(e))});
     }
   }
 
   Array.prototype.forEach.call(document.querySelectorAll('th[data-k]'),function(th){
-    th.onclick=function(){var k=th.getAttribute('data-k');if(sortKey===k)sortDir=-sortDir;else{sortKey=k;sortDir=1}render()};
+    th.onclick=function(){var k=th.getAttribute('data-k');if(sortKey===k)sortDir=-sortDir;else{sortKey=k;sortDir=1}refreshPage(true)};
   });
-  $('q').oninput=render;
-  $('filterBrand').onchange=function(){
-    brandFilter=this.value;
-    render();
-  };
-  $('filterStatus').onchange=function(){
-    statusFilter=this.value;
-    render();
-  };
+  $('q').oninput=refreshSoon;
+  $('filterBrand').onchange=function(){brandFilter=this.value;refreshPage(true)};
+  $('filterStatus').onchange=function(){statusFilter=this.value;refreshPage(true)};
 
   function download(name,text,type){
     var blob=new Blob([text],{type:type});
@@ -1396,14 +1400,42 @@ function initApp(){
     var t=String(v).trim();
     return t.length<=3?t.toUpperCase():t.charAt(0).toUpperCase()+t.slice(1);
   }
-  function buildItems(sets,defBrand){
-    var items=[],updates=[],dup=0,updated=0,bad=0,badSamples=[],newBrands=[],byBrand={},updateMode=$('impUpdate').checked;
-    var seenNum={},seenSim={},existingNum={},existingSim={};
-    data.forEach(function(r){
-      seenNum[norm(r.number)]=1;if(r.simNo)seenSim[norm(r.simNo)]=1;
-      if(r.number)existingNum[norm(r.number)]=r;
-      if(r.simNo)existingSim[norm(r.simNo)]=r;
+  // Pull every candidate mobile no. / SIM no. out of the parsed file (used to ask the server what already exists)
+  function extractCandidates(sets){
+    var nums={},sims={};
+    sets.forEach(function(s){
+      var a=analyze(s.rows);
+      if(a.map.number===undefined)return;
+      a.dataRows.forEach(function(r){
+        var m=validMobile(cellVal(r,a.map.number));
+        if(!m)return;
+        nums[norm(fmtMobile(m))]=1;
+        var sim=cellVal(r,a.map.simNo);
+        if(/^[\d\s-]+$/.test(sim))sim=sim.replace(/[\s-]/g,'');
+        if(sim)sims[norm(sim)]=1;
+      });
     });
+    return {numbers:Object.keys(nums),sims:Object.keys(sims)};
+  }
+  // Ask the server which of those already exist (1000 per request)
+  async function lookupExisting(c){
+    var CH=1000,i,existingNum={},existingSim={};
+    var n=Math.max(c.numbers.length,c.sims.length);
+    for(i=0;i<n;i+=CH){
+      var j=await api('POST','/api/lookup',{numbers:c.numbers.slice(i,i+CH),sims:c.sims.slice(i,i+CH)});
+      (j.items||[]).forEach(function(r){
+        if(r.numberNorm)existingNum[r.numberNorm]=r;
+        if(r.simNorm)existingSim[r.simNorm]=r;
+      });
+    }
+    return {num:existingNum,sim:existingSim};
+  }
+
+  function buildItems(sets,defBrand,existing){
+    var items=[],updates=[],dup=0,updated=0,bad=0,badSamples=[],newBrands=[],byBrand={},updateMode=$('impUpdate').checked;
+    var seenNum={},seenSim={},existingNum={},existingSim={},updatedIds={};
+    Object.keys(existing.num).forEach(function(k){seenNum[k]=1;existingNum[k]=existing.num[k]});
+    Object.keys(existing.sim).forEach(function(k){seenSim[k]=1;existingSim[k]=existing.sim[k]});
     sets.forEach(function(s){
       var a=analyze(s.rows);
       if(a.map.number===undefined){bad+=a.dataRows.length;return}
@@ -1420,19 +1452,17 @@ function initApp(){
         var bc=cellVal(r,a.map.brand);
         var brand=bc?matchBrand(bc):(sheetBrand||defBrand);
         var status=a.map.status===undefined?'Active':normalizeStatus(cellVal(r,a.map.status));
-        var existing=existingNum[norm(number)]||(sim&&existingSim[norm(sim)]);
+        var ex=existingNum[norm(number)]||(sim&&existingSim[norm(sim)]);
         if(seenNum[norm(number)]||(sim&&seenSim[norm(sim)])){
-          if(updateMode&&existing){
+          if(updateMode&&ex&&!updatedIds[ex.id]){
             // Only overwrite fields the file actually provides (blank/missing = keep existing)
-            var update={id:existing.id,number:number,
-              account:acct||existing.account||'',
-              simNo:sim||existing.simNo||'',
-              brand:bc?brand:(existing.brand||brand),
-              status:a.map.status!==undefined&&cellVal(r,a.map.status)!==''?status:normalizeStatus(existing.status)};
-            updates.push(update);
+            updates.push({id:ex.id,number:number,
+              account:acct||ex.account||'',
+              simNo:sim||ex.simNo||'',
+              brand:bc?brand:(ex.brand||brand),
+              status:a.map.status!==undefined&&cellVal(r,a.map.status)!==''?status:normalizeStatus(ex.status)});
+            updatedIds[ex.id]=1;
             updated++;
-            if(number)existingNum[norm(number)]=existing;
-            if(sim)existingSim[norm(sim)]=existing;
           }else{
             dup++;
           }
@@ -1453,20 +1483,32 @@ function initApp(){
     $('dropFileName').hidden=!hasFile;
     $('dropFileName').textContent=hasFile?'📄 Uploaded: '+pending.title:'';
   }
-  function openPreview(title,sets){
-    pending={title:title,sets:sets,warn:lossy};
+  async function openPreview(title,sets){
+    pending={title:title,sets:sets,warn:lossy,existing:null};
+    var mine=pending;
     syncUploadUI();
     $('impTitle').textContent='📥 '+title;
     $('impBrand').innerHTML=brands.map(function(b){return '<option>'+esc(b)+'</option>'}).join('');
     $('impBrand').value=(tab!=='__all'?tab:brands[0]);
-    updatePreview();
+    $('impSum').innerHTML='<div>⏳ Sinusuri ang file laban sa database...</div>';
+    $('impPv').innerHTML='';
+    $('impGo').disabled=true;$('impGo').textContent='Apply';
     $('impDlg').showModal();
+    try{
+      var ex=await lookupExisting(extractCandidates(sets));
+      if(pending!==mine)return; // dialog was closed / another file opened
+      pending.existing=ex;
+      updatePreview();
+    }catch(e){
+      if(pending===mine)$('impSum').innerHTML='<div class="warn">⚠ '+esc(errMsg(e))+'</div>';
+    }
   }
   function updatePreview(){
-    var r=buildItems(pending.sets,$('impBrand').value);
+    if(!pending||!pending.existing)return;
+    var r=buildItems(pending.sets,$('impBrand').value,pending.existing);
     pending.result=r;
     var parts=Object.keys(r.byBrand).map(function(b){return esc(b)+': <b>'+r.byBrand[b]+'</b>'}).join(' • ');
-    var h='<div class="ok">✔ Nabasa: '+r.items.length+' SIM'+(parts?' ('+parts+')':'')+'</div>';
+    var h='<div class="ok">✔ Bago: '+r.items.length+' SIM'+(parts?' ('+parts+')':'')+'</div>';
     if(r.updated)h+='<div class="ok">↻ Iu-update: <b>'+r.updated+'</b> existing SIM</div>';
     if(r.dup)h+='<div>↪ Na-skip (nasa inventory na / doble sa file): <b>'+r.dup+'</b></div>';
     if(r.bad)h+='<div class="warn">⚠ Hindi nabasa na Mobile No.: <b>'+r.bad+'</b>'+(r.badSamples.length?' (hal. '+r.badSamples.map(esc).join(', ')+')':'')+'</div>';
@@ -1477,7 +1519,7 @@ function initApp(){
       r.items.slice(0,8).map(function(x){return '<tr><td>'+esc(x.number)+'</td><td>'+esc(x.account)+'</td><td>'+esc(x.simNo)+'</td><td>'+esc(x.brand)+'</td><td>'+esc(normalizeStatus(x.status))+'</td></tr>'}).join('')+
       '</tbody></table>'+(r.items.length>8?'<div class="note" style="padding:6px 10px;margin:0">...at '+(r.items.length-8)+' pa</div>':'');
     var total=r.items.length+r.updated;
-    $('impPv').innerHTML=total?pv:'<div class="empty">Walang nabasang valid na Mobile No. Siguraduhing may column ng mobile numbers (hal. 0917 123 4567).</div>';
+    $('impPv').innerHTML=total?pv:'<div class="empty">Walang bagong SIM na maidadagdag. (Walang valid na Mobile No., o nasa inventory na lahat.)</div>';
     $('impGo').disabled=!total;
     $('impGo').textContent=total?'Apply '+total+' SIM':'Apply';
   }
@@ -1494,32 +1536,25 @@ function initApp(){
   }
   $('impRemove').onclick=removeUploadedFile;
   $('impCancel').onclick=function(){$('impDlg').close();pending=null;syncUploadUI()};
-  $('impDlg').addEventListener('close',function(){if(pending){pending=null;syncUploadUI()}});
+  $('impDlg').addEventListener('close',function(){if(pending&&!pending.busy){pending=null;syncUploadUI()}});
   $('impGo').onclick=async function(){
     if(!pending||!pending.result)return;
     var r=pending.result, keys=Object.keys(r.byBrand);
-    if(ONLINE){
-      $('impGo').disabled=true;$('impGo').textContent='Ini-import...';
-      try{
-        for(var u=0;u<r.updates.length;u++){
-          var update=Object.assign({},r.updates[u]);delete update.id;
-          await api('PUT','/api/sims/'+encodeURIComponent(r.updates[u].id),update);
-        }
-        await bulkSend(r.items,r.newBrands);
-        tab=keys.length===1?keys[0]:'__all';
-        await loadRemote();
-        $('impDlg').close();pending=null;syncUploadUI();
-      }catch(err){alert(errMsg(err));$('impGo').disabled=false;$('impGo').textContent='Apply '+(r.items.length+r.updated)+' SIM'}
-      return;
+    pending.busy=true;
+    $('impGo').disabled=true;$('impGo').textContent='Ini-import...';
+    try{
+      var res=await bulkSend(r.items,r.newBrands,r.updates,function(done,total){$('impGo').textContent='Ini-import... '+done+'/'+total});
+      tab=keys.length===1?keys[0]:'__all';page=1;
+      pending=null;$('impDlg').close();syncUploadUI();
+      await loadRemote();
+      var skipped=(r.items.length-res.inserted)+(r.updates.length-res.updated);
+      if(skipped>0)alert('Tapos: '+res.inserted+' bago, '+res.updated+' na-update. '+skipped+' ang na-skip dahil may kapareho na (baka may ibang nag-import nang sabay).');
+    }catch(err){
+      if(pending)pending.busy=false;
+      alert(errMsg(err)+'\n\nPuwedeng may bahagi nang na-import. I-check ang listahan bago ulitin.');
+      $('impGo').disabled=false;$('impGo').textContent='Apply '+(r.items.length+r.updated)+' SIM';
+      loadRemote().catch(function(){});
     }
-    r.newBrands.forEach(function(b){if(brands.indexOf(b)===-1)brands.push(b)});
-    r.updates.forEach(function(u){
-      data=data.map(function(x){return x.id===u.id?Object.assign({},x,{number:u.number,account:u.account,simNo:u.simNo,brand:u.brand,status:u.status}):x});
-    });
-    r.items.forEach(function(x){x.id=uid();data.push(x)});
-    tab=keys.length===1?keys[0]:'__all';
-    save();render();
-    $('impDlg').close();pending=null;syncUploadUI();
   };
 
   // ---------- file intake ----------
@@ -1572,36 +1607,40 @@ function initApp(){
     openPreview('Na-paste mula sa Excel',[{name:'',rows:rows}]);
   };
 
-  // ---------- export CSV ----------
+  // ---------- export CSV (all rows matching the current tab/search/filters, not just this page) ----------
   function csvCell(v){v=String(v==null?'':v);return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v}
   function textCell(v){v=String(v==null?'':v);return /^\d{8,}$/.test(v)?csvCell('="'+v+'"'):csvCell(v)}
+  async function withBusy(btn,label,fn){
+    var old=btn.textContent;btn.disabled=true;
+    try{return await fn(function(n){btn.textContent=label+' '+n})}
+    finally{btn.disabled=false;btn.textContent=old}
+  }
   $('btnCsv').onclick=function(){
-    var q=$('q').value.trim().toLowerCase();
-    var list=data.filter(function(r){
-      if(tab!=='__all'&&r.brand!==tab)return false;
-      if(brandFilter!=='__all'&&r.brand!==brandFilter)return false;
-      if(statusFilter!=='__all'&&normalizeStatus(r.status)!==statusFilter)return false;
-      if(q){
-        var hay=[r.number,r.account,r.simNo,r.brand,r.status].join(' ').toLowerCase();
-        if(hay.indexOf(q)===-1&&hay.replace(/[\s-]/g,'').indexOf(q.replace(/[\s-]/g,''))===-1)return false;
-      }
-      return true;
-    });
-    var lines=['Mobile No.,Account No.,Physical SIM Card No.,Brand,Status'].concat(list.map(function(r){
-      return [csvCell(r.number),textCell(r.account),textCell(r.simNo),csvCell(r.brand),csvCell(normalizeStatus(r.status))].join(',');
-    }));
-    download('sim_inventory_'+(tab==='__all'?'lahat':tab)+'_'+today()+'.csv','\ufeff'+lines.join('\r\n'),'text/csv;charset=utf-8');
+    if(filterConflict()){alert('Walang tumugma sa kasalukuyang filter.');return}
+    var btn=this;
+    withBusy(btn,'Kinukuha...',async function(progress){
+      var list=await exportAll(filterParams(),progress);
+      var lines=['Mobile No.,Account No.,Physical SIM Card No.,Brand,Status'].concat(list.map(function(r){
+        return [csvCell(r.number),textCell(r.account),textCell(r.simNo),csvCell(r.brand),csvCell(normalizeStatus(r.status))].join(',');
+      }));
+      download('sim_inventory_'+(tab==='__all'?'lahat':tab)+'_'+today()+'.csv','﻿'+lines.join('\r\n'),'text/csv;charset=utf-8');
+    }).catch(function(e){alert(errMsg(e))});
   };
 
   $('btnPrint').onclick=function(){window.print()};
   $('btnTemplate').onclick=function(){
     var template='Mobile No.,Account No.,Physical SIM Card No.,Brand,Status\r\n';
-    download('SIM_Inventory_Template.csv','\ufeff'+template,'text/csv;charset=utf-8');
+    download('SIM_Inventory_Template.csv','﻿'+template,'text/csv;charset=utf-8');
   };
 
-  // ---------- backup / restore ----------
+  // ---------- backup / restore (whole database) ----------
   $('btnBackup').onclick=function(){
-    download('sim_inventory_backup_'+today()+'.json',JSON.stringify({version:2,exported:new Date().toISOString(),brands:brands,data:data},null,2),'application/json');
+    var btn=this;
+    withBusy(btn,'Backup...',async function(progress){
+      await loadSummary();
+      var all=await exportAll(new URLSearchParams(),progress);
+      download('sim_inventory_backup_'+today()+'.json',JSON.stringify({version:3,exported:new Date().toISOString(),brands:brands,data:all},null,2),'application/json');
+    }).catch(function(e){alert(errMsg(e))});
   };
   $('btnRestore').onclick=function(){$('fileJson').click()};
   $('fileJson').onchange=function(){
@@ -1613,53 +1652,60 @@ function initApp(){
         var obj=JSON.parse(String(rd.result));
         var arr=Array.isArray(obj)?obj:obj.data;
         if(!Array.isArray(arr))throw new Error('bad');
-        nd=arr.map(function(r){return {id:r.id||uid(),number:r.number||'',account:r.account||'',simNo:r.simNo||r.iccid||'',brand:r.brand||r.carrier||'Globe',status:normalizeStatus(r.status)}});
-        nb=Array.isArray(obj.brands)&&obj.brands.length?obj.brands.slice():['Globe','Smart'];
+        nd=arr.map(function(r){return {number:r.number||'',account:r.account||'',simNo:r.simNo||r.iccid||'',brand:normalizeLegacyBrandName(r.brand||r.carrier||'Globe'),status:normalizeStatus(r.status)}}).filter(function(r){return r.number});
+        nb=(Array.isArray(obj.brands)&&obj.brands.length?obj.brands.slice():['Globe','Smart']).map(normalizeLegacyBrandName);
         nd.forEach(function(r){if(nb.indexOf(r.brand)===-1)nb.push(r.brand)});
       }catch(e){alert('Hindi valid na backup file.');return}
-      if(!confirm('Papalitan nito ang lahat ng current data ng '+nd.length+' SIM mula sa backup. Tuloy?'))return;
-      if(ONLINE){
-        try{await api('POST','/api/clear');await bulkSend(nd,nb);tab='__all';await loadRemote()}catch(err){alert(errMsg(err))}
-        return;
-      }
-      data=nd;brands=nb;tab='__all';save();render();
+      if(!confirm('Papalitan nito ang LAHAT ng data sa shared database ng '+nd.length+' SIM mula sa backup.\n\nMakikita ito ng lahat ng user. Tuloy?'))return;
+      var btn=$('btnRestore');
+      try{
+        await withBusy(btn,'Restoring...',async function(progress){
+          await api('POST','/api/clear');
+          await bulkSend(nd,nb,[],function(done,total){progress(done+'/'+total)});
+        });
+        tab='__all';page=1;await loadRemote();
+      }catch(err){alert(errMsg(err));loadRemote().catch(function(){})}
     };
     rd.readAsText(f);this.value='';
   };
 
-  if(ONLINE){
-    $('noteTxt').innerHTML='🌐 <b>Shared ang data</b> — iisang listahan ang nakikita ng lahat ng user at awtomatiko itong nagre-refresh. Mag-<b>Backup (JSON)</b> paminsan-minsan para may kopya ka.';
-    // One-time: offer to upload SIMs that were saved in this browser (old offline version)
-    async function migrateLocal(){
-      var MIG='sim_migrated_to_server_v1';
-      if(curVer===null||!canEdit)return; // server data didn't load, or viewer account
-      try{if(localStorage.getItem(MIG))return}catch(e){return}
-      var local=read(KEY);
-      if(!Array.isArray(local)||!local.length){try{localStorage.setItem(MIG,'1')}catch(e){}return}
-      var lb=read(BKEY);
-      if(!confirm('May '+local.length+' SIM na naka-save sa browser na ito (galing sa lumang offline version).\n\nI-upload ba sa shared database? (Ang mga kapareho na ay automatic na ini-skip.)'))return;
-      var items=local.map(function(r){return {number:r.number||'',account:r.account||'',simNo:r.simNo||'',brand:normalizeLegacyBrandName(r.brand)||'Globe',status:normalizeStatus(r.status)}});
-      var nb=(Array.isArray(lb)?lb:[]).map(normalizeLegacyBrandName);
-      try{
-        var n=await bulkSend(items,nb);
-        try{localStorage.setItem(MIG,'1')}catch(e){}
-        await loadRemote();
-        alert('Na-upload: '+n+' SIM. Na-skip (nandoon na): '+(items.length-n)+'.\n\nNaka-save pa rin ang lumang kopya sa browser bilang backup.');
-      }catch(e){alert('Hindi na-upload: '+errMsg(e))}
-    }
-    function showLoading(){$('tbody').innerHTML='<tr><td colspan="7" class="empty">Naglo-load...</td></tr>'}
-    function loadOrShowError(){
-      return loadRemote().catch(function(e){if(e&&e.status===401)return;$('tbody').innerHTML='<tr><td colspan="7" class="empty">Hindi ma-load ang data: '+esc(e.message)+'</td></tr>'});
-    }
-    reloadApp=function(){showLoading();loadOrShowError()};
-    showLoading();
-    loadOrShowError().then(migrateLocal);
-    setInterval(function(){
-      if(document.hidden||document.querySelector('dialog[open]'))return;
-      if($('appContent').style.display==='none')return; // logged out
-      api('GET','/api/ver').then(function(j){if(j.ver!==curVer)return loadRemote()}).catch(function(){});
-    },30000);
-  }else render();
+  // ---------- startup ----------
+  $('noteTxt').innerHTML='🌐 <b>Shared ang data</b> — iisang listahan ang nakikita ng lahat ng user at awtomatiko itong nagre-refresh. Mag-<b>Backup (JSON)</b> paminsan-minsan para may kopya ka.';
+
+  // One-time: offer to upload SIMs that were saved in this browser (old offline version)
+  async function migrateLocal(){
+    var MIG='sim_migrated_to_server_v1';
+    if(curVer===null||!canEdit)return; // server data didn't load, or viewer account
+    try{if(localStorage.getItem(MIG))return}catch(e){return}
+    var local=read(KEY);
+    if(!Array.isArray(local)||!local.length){try{localStorage.setItem(MIG,'1')}catch(e){}return}
+    var lb=read(BKEY);
+    if(!confirm('May '+local.length+' SIM na naka-save sa browser na ito (galing sa lumang offline version).\n\nI-upload ba sa shared database? (Ang mga kapareho na ay automatic na ini-skip.)'))return;
+    var items=local.map(function(r){return {number:r.number||'',account:r.account||'',simNo:r.simNo||'',brand:normalizeLegacyBrandName(r.brand)||'Globe',status:normalizeStatus(r.status)}});
+    var nb=(Array.isArray(lb)?lb:[]).map(normalizeLegacyBrandName);
+    try{
+      var res=await bulkSend(items,nb);
+      try{localStorage.setItem(MIG,'1')}catch(e){}
+      await loadRemote();
+      alert('Na-upload: '+res.inserted+' SIM. Na-skip (nandoon na): '+(items.length-res.inserted)+'.\n\nNaka-save pa rin ang lumang kopya sa browser bilang backup.');
+    }catch(e){alert('Hindi na-upload: '+errMsg(e))}
+  }
+  function showLoading(){$('tbody').innerHTML='<tr><td colspan="7" class="empty">Naglo-load...</td></tr>'}
+  // On re-login (possibly a different user/role) start from a clean view
+  reloadApp=function(){
+    tab='__all';brandFilter='__all';statusFilter='__all';sortKey='number';sortDir=1;page=1;data=[];
+    $('q').value='';$('filterStatus').value='__all';$('filterBrand').value='__all';
+    showLoading();loadRemote().catch(showLoadErr);
+  };
+  showLoading();
+  loadRemote().then(migrateLocal,showLoadErr);
+
+  // Auto-refresh: poll the tiny version counter; only reload (summary + current page) when data changed
+  setInterval(function(){
+    if(document.hidden||document.querySelector('dialog[open]'))return;
+    if($('appContent').style.display==='none')return; // logged out
+    api('GET','/api/ver').then(function(j){if(j.ver!==curVer)return loadRemote()}).catch(function(){});
+  },30000);
 
 } // end initApp
 
