@@ -1,142 +1,108 @@
-# 📦 PROJECT TIME CAPSULE & DEVELOPER HANDOVER GUIDE
-> **Project Name:** SIM Card Inventory Web Application  
-> **Last Updated:** November 19, 2026  
-> **Target Audience:** Next Developer / Maintainer / Any AI Assistant (Claude, ChatGPT, Gemini, Cursor, Copilot, etc.)
+# 📦 PROJECT HANDOVER GUIDE
+> **Project:** SIM Card Inventory Web Application
+> **Last Updated:** November 20, 2026
+> **For:** next developer / maintainer / AI assistant
 
 ---
 
-## 📌 1. Project Overview & Objective
-This project is a lightweight, responsive, single-page **SIM Card Inventory Management System** built with vanilla HTML, CSS, and JavaScript (Zero external dependencies). It was designed to run offline-first via browser `localStorage` and hosted globally via **Cloudflare Pages**.
+## 1. Overview
+Single-page **SIM Card Inventory** app (vanilla HTML/CSS/JS, no frontend framework) hosted on **Cloudflare Pages**, with a **Cloudflare Pages Function** API and a **Cloudflare D1** (SQLite) database. All users see the same shared inventory.
 
-### Key Use-Cases:
-- Tracking mobile numbers, account numbers, physical SIM card serial numbers (ICCID), and telecommunications brands (Globe, Smart, DITO, TNT, etc.).
-- Parsing, importing, and auto-detecting Excel (`.xlsx`) and CSV files directly inside the browser using a custom internal ZIP/XML reader without heavy external libraries.
-- Managing SIM inventories with brand tabs, instant search, sorting, printing, CSV export, and JSON backup/restore.
-- Protecting the interface using a client-side authentication gate with brute-force lockout, session management, and security audit logs.
+Features: brand tabs, search, brand/status filters, sorting, add/edit/delete, Excel (`.xlsx`) / CSV / paste import with auto column detection (custom in-browser ZIP/XML reader — no library), CSV export, JSON backup/restore, print, security log.
 
 ---
 
-## 📂 2. Directory Structure & File Manifest
-
+## 2. Files
 ```text
 Sim Inventory/
+├── index.html                 <-- Master source of the frontend
 ├── deploy/
-│   └── index.html             <-- Production-ready file deployed to Cloudflare Pages
-├── SIM_Inventory_FIXED_DragDrop_Import_Remove.html <-- Master source file (identical to deploy/index.html)
-├── .wrangler/                  <-- Cloudflare Wrangler CLI cache and state
-│   └── cache/
-│       ├── pages.json
-│       └── wrangler-account.json
-├── README.md                   <-- Quick start guide
-└── PROJECT_HANDOVER.md         <-- This time capsule document
+│   ├── index.html             <-- Copy of index.html that gets deployed (keep identical)
+│   └── _headers               <-- Security headers (anti-clickjacking, nosniff)
+├── functions/api/[[route]].js <-- Server API (login + all data routes) — Pages Function
+├── schema.sql                 <-- D1 tables (sims, brands, meta, auth_log, login_attempts)
+├── wrangler.toml              <-- Cloudflare config (D1 binding "DB", output dir "deploy")
+├── package.json               <-- npm scripts + Wrangler dev dependency
+├── .dev.vars                  <-- LOCAL ONLY test secrets (git-ignored)
+└── README.md / PROJECT_HANDOVER.md
 ```
+`.wrangler/`, `node_modules/`, `.dev.vars` are git-ignored.
 
 ---
 
-## 🌐 3. Cloudflare Hosting & Deployment Status
+## 3. Cloudflare
+| Item | Value |
+|---|---|
+| Pages project | `sim-inventory` → https://sim-inventory.pages.dev |
+| Production branch | `main` |
+| D1 database | `sim-inventory-db` (binding `DB`, id in `wrangler.toml`) |
+| Secrets | `ADMIN_PASSWORD`, `TOKEN_SECRET` (encrypted, set via Wrangler) |
+| Account | IT helpdesk Cloudflare account — check with `npm run whoami` |
 
-- **Hosting Platform:** Cloudflare Pages (Free Tier)
-- **Connected Cloudflare Account:** *(IT helpdesk Cloudflare account)*
-- **Cloudflare Account ID:** *(tingnan sa `wrangler whoami`)*
-- **Project Name:** `sim-inventory`
-- **Live Production URL:** [https://sim-inventory.pages.dev](https://sim-inventory.pages.dev)
-- **Deployment Command (Wrangler):**
-  ```powershell
-  cd "c:\Users\<USER>\Documents\Sim Inventory"
-  wrangler pages deploy deploy --project-name sim-inventory
-  ```
-
----
-
-## 🔑 4. Authentication & Credentials
-
-The application is protected by a login gate. The default administrator credentials are:
-
-- **Username:** `administrator`
-- **Password:** *(itanong sa system administrator — hindi naka-store sa repo)*
-
-### How Authentication Works:
-- **No Plaintext Passwords:** Passwords are not saved in plaintext inside the source code.
-- **Combined SHA-256 Hashing:** 
-  $$\text{Hash} = \text{SHA-256}(\text{username} + ":" + \text{password})$$
-  $$\text{Hash of } \texttt{"administrator:<password>"} = \texttt{3f7d4c15aab6cbd482d837231a50430473c982c5bc1c423db3593ab73231cc13}$$
-- **Storage:** Account credentials are encrypted/hashed and seeded into `localStorage['sim_auth_accounts']`.
-- **Session Lifespan:** An active session token is stored in `sessionStorage['sim_auth_session']`. If the user closes the browser tab, the session terminates immediately.
+Source code: https://github.com/hcducusinithelpdesk-ux/simventory
+(Deploy is **manual** — pushing to GitHub does not deploy.)
 
 ---
 
-## 🛡️ 5. Security & Pentest Implementation
-
-A lightweight client-side security hardening was conducted to secure the web application:
-
-1. **Brute-Force & Rate Limiting:**
-   - Tracks failed attempts in `sessionStorage['sim_auth_lockout']`.
-   - Max 5 failed attempts allowed before triggering a **5-minute lockout** with a live countdown timer.
-2. **Session Inactivity & Auto-Logout:**
-   - 15 minutes of user inactivity (mouse/keyboard) automatically logs the user out.
-   - A warning notification toast pops up 2 minutes prior to session expiration.
-3. **Content Security Policy (CSP):**
-   - Configured via `<meta http-equiv="Content-Security-Policy">` to disallow external script execution, prevent framing/clickjacking (`frame-src 'none'`), and disable plugins (`object-src 'none'`).
-4. **XSS Sanitization:**
-   - Uses an HTML entity encoder (`escHtml` / `sanitize`) across all user-rendered data, inputs, and audit logs.
-5. **Security Audit Log:**
-   - Records the last 20 login attempts (timestamp, username, status, user agent) accessible through the `🛡️` button in the header.
+## 4. Authentication
+- Login is verified **server-side** by `POST /api/login` against the `ADMIN_PASSWORD` secret (username `administrator`, overridable with an `ADMIN_USER` secret). No password or hash exists in the frontend.
+- Server returns an HMAC-signed token (12h). The browser keeps it in `sessionStorage` and sends `Authorization: Bearer <token>` on every API call. Closing the tab ends the session.
+- **Brute force:** 5 failed logins per IP → 5-minute lock (table `login_attempts`).
+- **Idle logout:** 15 min of no activity (warning 2 min before).
+- **Audit log:** every login attempt saved in `auth_log` (last 200 kept); 🛡️ button shows the last 20.
+- **Change password:** `npm run set-password` (takes effect immediately; existing sessions stay valid until they expire — run `npm run set-token-secret` with a new value to force everyone to log in again).
 
 ---
 
-## ⚙️ 6. How to Run & Maintain This Project in VS Code
+## 5. API (`functions/api/[[route]].js`)
+All routes need the Bearer token except login.
 
-### Prerequisites:
-- **Node.js** (v18+ recommended)
-- **Wrangler CLI** (Cloudflare CLI tool):
-  ```powershell
-  npm install -g wrangler
-  ```
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/login` | `{username,password}` → `{token,username,expiresAt}` |
+| GET | `/api/state` | all SIMs + brands + version |
+| GET | `/api/ver` | data version (frontend polls every 30s to auto-refresh) |
+| GET | `/api/log` | last 20 login attempts |
+| POST | `/api/sims` | add SIM (409 if mobile no. or SIM no. already exists) |
+| PUT / DELETE | `/api/sims/:id` | edit / delete SIM |
+| POST | `/api/bulk` | import up to 500 SIMs (duplicates skipped) |
+| POST | `/api/brands` | add brand |
+| PUT / DELETE | `/api/brands/:name` | rename / delete brand (delete only if unused) |
+| POST | `/api/clear` | delete everything (used by Restore) |
 
-### Local Development / Testing:
-1. Open the folder in VS Code:
-   ```powershell
-   code "c:\Users\<USER>\Documents\Sim Inventory"
-   ```
-2. You can preview `deploy/index.html` locally using VS Code's **Live Server** extension, or run:
-   ```powershell
-   npx wrangler pages dev deploy
-   ```
-   This will give you a local URL like `http://localhost:8788`.
-
-### Updating the Code & Re-deploying:
-1. Edit `deploy/index.html` (and copy changes to `SIM_Inventory_FIXED_DragDrop_Import_Remove.html`).
-2. Deploy to Cloudflare Pages:
-   ```powershell
-   wrangler pages deploy deploy --project-name sim-inventory
-   ```
-3. If changing Cloudflare accounts:
-   ```powershell
-   wrangler logout
-   wrangler login
-   ```
+Uniqueness is enforced by the DB on normalized mobile no. and SIM no. (spaces/dashes removed).
 
 ---
 
-## 🚀 7. Roadmap & Recommendations for the Next Developer
+## 6. Common tasks
+> On Windows PowerShell, use `npm.cmd` if `npm` gives "running scripts is disabled".
 
-If you or a future AI model are tasked with taking this project to the next level, here is the recommended architecture roadmap:
+```powershell
+npm install                 # first time on a new PC
+npm run login               # Cloudflare login (browser)
+# edit index.html, then:
+copy index.html deploy\index.html
+npm run deploy
+git add -A; git commit -m "describe change"; git push
+```
+Local testing: `npm run db:init-local` once, then `npm run dev` → http://localhost:8788 (uses `.dev.vars` test password).
 
-1. **Transition from LocalStorage to Cloudflare D1 / KV Database:**
-   - Currently, SIM records exist per client browser (`localStorage`).
-   - The code already contains an `/api/` hooks skeleton (`/api/state`, `/api/sims`, `/api/bulk`, `/api/brands`).
-   - You can create a Cloudflare Worker or Pages Function (`functions/api/[[route]].js`) attached to a Cloudflare D1 SQLite database to make the inventory shared and synced across multiple devices in real-time.
-2. **Cloudflare Zero Trust / Cloudflare Access:**
-   - For enterprise-grade protection, you can gate the entire domain `sim-inventory.pages.dev` behind **Cloudflare Zero Trust (Access)** with OTP email codes or Google Workspace SSO, removing the need for client-side password hashing.
-3. **Role-Based Access Control (RBAC):**
-   - Differentiate Admin (Read/Write/Delete) from Viewer (Read-only/Search).
+Backup: use **Backup (JSON)** in the app, or
+`npx wrangler d1 export sim-inventory-db --remote --output backup.sql`.
 
 ---
 
-## 🤖 8. Instructions for Future AI Models
-> *If you are an AI assistant (Claude, ChatGPT, Gemini, Copilot, etc.) reading this file:*
-> 
-> - Treat this document as the single source of truth for the project state.
-> - Always maintain the two identical files: `deploy/index.html` and `SIM_Inventory_FIXED_DragDrop_Import_Remove.html`.
-> - Do not break the internal XLSX parser when refactoring JavaScript.
-> - Preserved hashed authentication logic unless explicitly requested to connect a server-side database (e.g., Cloudflare D1/Workers).
+## 7. Migration from the old offline version
+Older versions stored data in each browser's `localStorage`. On first login in a browser that still has that data, the app offers to upload it to the shared database (duplicates are skipped). The local copy is kept as a backup.
+
+---
+
+## 8. Ideas for next steps
+- Multiple user accounts / roles (admin vs view-only).
+- Auto-deploy on GitHub push (connect repo in Cloudflare Pages or use GitHub Actions).
+- Cloudflare Access (Zero Trust) in front of the site for SSO/OTP.
+
+## 9. Notes for AI assistants
+- Keep `index.html` and `deploy/index.html` identical.
+- Don't break the in-browser XLSX parser (`unzip` / `readXlsx` / `parseSheet`).
+- Never put passwords, hashes, or secrets in the repo — use Wrangler secrets.

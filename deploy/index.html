@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="tl">
+<html lang="tl" data-mode="online">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -336,8 +336,6 @@
   'use strict';
 
   // ========== Constants ==========
-  var AUTH_ACCOUNTS_KEY = 'sim_auth_accounts';
-  var AUTH_LOG_KEY = 'sim_auth_log';
   var SESSION_KEY = 'sim_auth_session';
   var LOCKOUT_KEY = 'sim_auth_lockout';
   var MAX_ATTEMPTS = 5;
@@ -346,27 +344,12 @@
   var IDLE_TIMEOUT = 15 * 60 * 1000; // 15 minutes
   var IDLE_WARNING = 2 * 60 * 1000; // warn 2 min before
 
-  // ========== Default Admin Account (SHA-256 hashed) ==========
-  // Username: administrator
-  // Combined hash = SHA-256("administrator:<password>")
-  var DEFAULT_ACCOUNTS = [
-    {
-      username: 'administrator',
-      hash: '3f7d4c15aab6cbd482d837231a50430473c982c5bc1c423db3593ab73231cc13'
-    }
-  ];
+  // Credentials are verified server-side (Cloudflare Pages Function /api/login).
+  // No password or password hash is stored in this file.
 
   // ========== Utility: DOM ==========
   function $(id){ return document.getElementById(id) }
   function escHtml(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]}) }
-
-  // ========== Utility: SHA-256 via Web Crypto API ==========
-  async function sha256(str){
-    var buf = new TextEncoder().encode(str);
-    var hashBuf = await crypto.subtle.digest('SHA-256', buf);
-    var hashArr = Array.from(new Uint8Array(hashBuf));
-    return hashArr.map(function(b){ return b.toString(16).padStart(2,'0') }).join('');
-  }
 
   // ========== Utility: Input Sanitization (XSS Protection) ==========
   function sanitize(input){
@@ -374,20 +357,6 @@
     return input.replace(/[<>"'&]/g, function(c){
       return {'<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','&':'&amp;'}[c];
     }).trim();
-  }
-
-  // ========== Account Management ==========
-  function getAccounts(){
-    try{
-      var stored = localStorage.getItem(AUTH_ACCOUNTS_KEY);
-      if(stored){
-        var accts = JSON.parse(stored);
-        if(Array.isArray(accts) && accts.length) return accts;
-      }
-    }catch(e){}
-    // Seed default account on first load
-    localStorage.setItem(AUTH_ACCOUNTS_KEY, JSON.stringify(DEFAULT_ACCOUNTS));
-    return DEFAULT_ACCOUNTS.slice();
   }
 
   // ========== Brute Force Protection ==========
@@ -456,36 +425,15 @@
     lockoutTimer = setInterval(tick, 1000);
   }
 
-  // ========== Audit Log ==========
-  function getAuditLog(){
-    try{
-      var s = localStorage.getItem(AUTH_LOG_KEY);
-      if(s) return JSON.parse(s);
-    }catch(e){}
-    return [];
-  }
-  function logAttempt(username, success){
-    var log = getAuditLog();
-    log.unshift({
-      username: sanitize(username),
-      success: !!success,
-      timestamp: new Date().toISOString(),
-      userAgent: navigator.userAgent.substring(0,100)
-    });
-    // Keep only last 20 entries
-    if(log.length > 20) log = log.slice(0,20);
-    try{ localStorage.setItem(AUTH_LOG_KEY, JSON.stringify(log)) }catch(e){}
-  }
+  // Remove leftovers from the old client-side auth (password hash / plaintext admin pw)
+  try{ ['sim_auth_accounts','sim_auth_log','sim_admin_pw'].forEach(function(k){ localStorage.removeItem(k) }) }catch(e){}
 
   // ========== Session Management ==========
-  function generateSessionToken(){
-    var random = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-      .map(function(b){return b.toString(16).padStart(2,'0')}).join('');
-    return random + '-' + Date.now().toString(36);
-  }
-  function createSession(username){
+  // token = signed by the server (/api/login); sent as "Authorization: Bearer <token>"
+  function createSession(username, token, serverExpiresAt){
     var session = {
-      token: generateSessionToken(),
+      token: token,
+      serverExpiresAt: serverExpiresAt,
       username: username,
       createdAt: Date.now(),
       lastActivity: Date.now(),
@@ -511,8 +459,9 @@
   }
   function isSessionValid(){
     var session = getSession();
-    if(!session) return false;
+    if(!session || !session.token) return false;
     if(Date.now() > session.expiresAt) return false;
+    if(session.serverExpiresAt && Date.now() > session.serverExpiresAt) return false;
     return true;
   }
   function destroySession(){
@@ -627,38 +576,37 @@
     loginBtn.textContent = 'Signing in...';
 
     try{
-      // Hash with combined approach: SHA-256(username:password)
-      var combined = username + ':' + password;
-      var hash = await sha256(combined);
-
-      var accounts = getAccounts();
-      var matched = accounts.some(function(acct){
-        return acct.username === username && acct.hash === hash;
+      // Credentials are checked by the server (Cloudflare Pages Function)
+      var res = await fetch('/api/login', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({username:username, password:password}),
+        cache:'no-store'
       });
+      var j = {}; try{ j = await res.json() }catch(e){}
 
-      if(matched){
+      if(res.ok && j.token){
         // Successful login
-        logAttempt(username, true);
         resetAttempts();
-        var session = createSession(username);
+        var session = createSession(j.username || username, j.token, j.expiresAt);
         showApp(session);
-      } else {
-        // Failed login
-        logAttempt(username, false);
-        var state = recordFailedAttempt();
-
-        if(state.lockedUntil > Date.now()){
-          startLockoutCountdown();
-        } else {
-          var remaining = MAX_ATTEMPTS - state.attempts;
-          errorEl.textContent = 'Invalid username or password. ' + remaining + ' attempt(s) remaining.';
-          errorEl.classList.add('show');
-        }
+      } else if(res.status === 429 && j.lockedUntil){
+        // Locked out by server (too many failed attempts from this IP)
+        setLockoutState({ attempts:MAX_ATTEMPTS, lockedUntil:j.lockedUntil });
+        startLockoutCountdown();
+        passwordInput.value = '';
+      } else if(res.status === 401){
+        var remaining = typeof j.remaining === 'number' ? j.remaining : '?';
+        errorEl.textContent = 'Invalid username or password. ' + remaining + ' attempt(s) remaining.';
+        errorEl.classList.add('show');
         passwordInput.value = '';
         passwordInput.focus();
+      } else {
+        errorEl.textContent = 'Server error: ' + (j.error || ('HTTP ' + res.status)) + '. Please try again.';
+        errorEl.classList.add('show');
       }
     }catch(e){
-      errorEl.textContent = 'Authentication error. Please try again.';
+      errorEl.textContent = 'Hindi maka-connect sa server. Tingnan ang internet connection at subukan ulit.';
       errorEl.classList.add('show');
     }
 
@@ -714,6 +662,9 @@
       errorEl.classList.add('show');
     }
 
+    // Don't leave inventory data in the page while logged out
+    if($('tbody')) $('tbody').innerHTML = '';
+
     // Clear inputs
     $('loginUser').value = '';
     $('loginPass').value = '';
@@ -728,9 +679,21 @@
   }
 
   // ========== Security Log Display ==========
-  function showSecurityLog(){
-    var log = getAuditLog();
+  async function showSecurityLog(){
     var listEl = $('secLogList');
+    listEl.innerHTML = '<div class="empty">Naglo-load...</div>';
+    $('secLogDlg').showModal();
+    var log = [];
+    try{
+      var s = getSession();
+      var res = await fetch('/api/log', {headers:{'Authorization':'Bearer ' + (s && s.token || '')}, cache:'no-store'});
+      if(res.status === 401){ $('secLogDlg').close(); performLogout('Session expired. Please sign in again.'); return }
+      var j = await res.json();
+      log = j.log || [];
+    }catch(e){
+      listEl.innerHTML = '<div class="empty">Hindi ma-load ang security log.</div>';
+      return;
+    }
     if(!log.length){
       listEl.innerHTML = '<div class="empty">No login attempts recorded.</div>';
     } else {
@@ -740,10 +703,9 @@
         return '<div class="log-entry ' + (entry.success?'success':'fail') + '">' +
           '<div><span class="log-user">' + escHtml(entry.username) + '</span>' +
           ' <span class="log-status ' + (entry.success?'s':'f') + '">' + (entry.success?'✔ Success':'✖ Failed') + '</span></div>' +
-          '<span class="log-time">' + escHtml(timeStr) + '</span></div>';
+          '<span class="log-time">' + escHtml(timeStr) + (entry.ip ? ' • ' + escHtml(entry.ip) : '') + '</span></div>';
       }).join('');
     }
-    $('secLogDlg').showModal();
   }
   $('secLogClose').onclick = function(){ $('secLogDlg').close() };
 
@@ -766,9 +728,6 @@
 
   // ========== Initialize: Check Existing Session ==========
   (function checkSession(){
-    // Seed default accounts if needed
-    getAccounts();
-
     if(isSessionValid()){
       var session = getSession();
       showApp(session);
@@ -783,9 +742,10 @@
 //  SIM INVENTORY APP (original functionality preserved)
 //  Only runs after successful authentication
 // ================================================================
+var reloadApp = null;
 function initApp(){
-  // Prevent re-initialization
-  if(window._simAppInitialized) return;
+  // Prevent re-initialization; on re-login just reload data from the server
+  if(window._simAppInitialized){ if(reloadApp) reloadApp(); return; }
   window._simAppInitialized = true;
 
   // Keep this column label fixed even if an older cached copy is opened.
@@ -813,17 +773,17 @@ function initApp(){
   function save(){try{localStorage.setItem(KEY,JSON.stringify(data));localStorage.setItem(BKEY,JSON.stringify(brands))}catch(e){alert('Hindi ma-save ang data sa browser. Mag-Backup (JSON) agad.')}}
 
   // ---------- online mode (Cloudflare) ----------
-  function getPw(){try{return localStorage.getItem('sim_admin_pw')||''}catch(e){return ''}}
   async function api(method,path,body){
-    var h={'Content-Type':'application/json'},p=getPw();
-    if(p)h['X-Admin-Password']=encodeURIComponent(p);
+    var h={'Content-Type':'application/json'},s=getSession();
+    if(s&&s.token)h['Authorization']='Bearer '+s.token;
     var res=await fetch(path,{method:method,headers:h,body:body?JSON.stringify(body):undefined,cache:'no-store'});
     var j={};try{j=await res.json()}catch(e){}
+    if(res.status===401){performLogout('Session expired. Please sign in again.')}
     if(!res.ok){var err=new Error(j.error||('Error '+res.status));err.status=res.status;throw err}
     return j;
   }
   function errMsg(e){
-    if(e&&e.status===401)return 'Kailangan ng admin password para mag-edit. I-click ang "Login para mag-edit" sa taas.';
+    if(e&&e.status===401)return 'Nag-expire ang session. Mag-login ulit.';
     if(e&&e.status===409)return 'May kapareho na ang Mobile No. o SIM Card No. na ito.';
     return (e&&e.message)||'May error. Subukan ulit.';
   }
@@ -896,7 +856,6 @@ function initApp(){
 
   function renameBrand(){
     if(!canEdit)return;
-    if(ONLINE){alert('Hindi pa available ang Rename Brand sa online/shared mode.');return}
     var oldName=tab!=='__all'?tab:(brandFilter!=='__all'?brandFilter:null);
     if(!oldName){
       oldName=(prompt('Pangalan ng brand na papalitan (hal. Globe):')||'').trim();
@@ -912,10 +871,9 @@ function initApp(){
       return;
     }
     if(ONLINE){
-      data.forEach(function(r){if(r.brand===oldName)r.brand=newName});
-      brands=brands.map(function(b){return b===oldName?newName:b});
-      tab=newName;brandFilter='__all';render();
-      alert('Ang brand tab ay pinalitan sa "'+newName+'". I-save ulit ang data sa backup o i-refresh kapag available ang server sync.');
+      api('PUT','/api/brands/'+encodeURIComponent(oldName),{name:newName})
+        .then(function(){tab=newName;brandFilter='__all';return loadRemote()})
+        .catch(function(e){alert(errMsg(e))});
       return;
     }
     data.forEach(function(r){if(r.brand===oldName)r.brand=newName});
@@ -1552,19 +1510,34 @@ function initApp(){
 
   if(ONLINE){
     $('noteTxt').innerHTML='🌐 <b>Shared ang data</b> — iisang listahan ang nakikita ng lahat ng user at awtomatiko itong nagre-refresh. Mag-<b>Backup (JSON)</b> paminsan-minsan para may kopya ka.';
-    var bl=$('btnLogin');
-    if(bl) bl.onclick=function(){
-      if(canEdit){try{localStorage.removeItem('sim_admin_pw')}catch(e){}loadRemote();return}
-      var p=prompt('Ilagay ang admin password:');if(p===null)return;
-      try{localStorage.setItem('sim_admin_pw',p)}catch(e){}
-      loadRemote().then(function(){
-        if(!canEdit){alert('Maling password.');try{localStorage.removeItem('sim_admin_pw')}catch(e){}}
-      });
-    };
-    $('tbody').innerHTML='<tr><td colspan="5" class="empty">Naglo-load...</td></tr>';
-    loadRemote().catch(function(e){$('tbody').innerHTML='<tr><td colspan="5" class="empty">Hindi ma-load ang data: '+esc(e.message)+'</td></tr>'});
+    // One-time: offer to upload SIMs that were saved in this browser (old offline version)
+    async function migrateLocal(){
+      var MIG='sim_migrated_to_server_v1';
+      if(curVer===null)return; // server data didn't load
+      try{if(localStorage.getItem(MIG))return}catch(e){return}
+      var local=read(KEY);
+      if(!Array.isArray(local)||!local.length){try{localStorage.setItem(MIG,'1')}catch(e){}return}
+      var lb=read(BKEY);
+      if(!confirm('May '+local.length+' SIM na naka-save sa browser na ito (galing sa lumang offline version).\n\nI-upload ba sa shared database? (Ang mga kapareho na ay automatic na ini-skip.)'))return;
+      var items=local.map(function(r){return {number:r.number||'',account:r.account||'',simNo:r.simNo||'',brand:normalizeLegacyBrandName(r.brand)||'Globe',status:normalizeStatus(r.status)}});
+      var nb=(Array.isArray(lb)?lb:[]).map(normalizeLegacyBrandName);
+      try{
+        var n=await bulkSend(items,nb);
+        try{localStorage.setItem(MIG,'1')}catch(e){}
+        await loadRemote();
+        alert('Na-upload: '+n+' SIM. Na-skip (nandoon na): '+(items.length-n)+'.\n\nNaka-save pa rin ang lumang kopya sa browser bilang backup.');
+      }catch(e){alert('Hindi na-upload: '+errMsg(e))}
+    }
+    function showLoading(){$('tbody').innerHTML='<tr><td colspan="7" class="empty">Naglo-load...</td></tr>'}
+    function loadOrShowError(){
+      return loadRemote().catch(function(e){if(e&&e.status===401)return;$('tbody').innerHTML='<tr><td colspan="7" class="empty">Hindi ma-load ang data: '+esc(e.message)+'</td></tr>'});
+    }
+    reloadApp=function(){showLoading();loadOrShowError()};
+    showLoading();
+    loadOrShowError().then(migrateLocal);
     setInterval(function(){
       if(document.hidden||document.querySelector('dialog[open]'))return;
+      if($('appContent').style.display==='none')return; // logged out
       api('GET','/api/ver').then(function(j){if(j.ver!==curVer)return loadRemote()}).catch(function(){});
     },30000);
   }else render();

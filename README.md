@@ -2,32 +2,25 @@
 
 Live Website: [https://sim-inventory.pages.dev](https://sim-inventory.pages.dev)
 
----
+Shared SIM inventory — iisang listahan para sa lahat ng computer. Naka-save ang data sa **Cloudflare D1** database, at sa server ginagawa ang login.
 
-## 🧭 Time Capsule & Handover Documentation
-Kung ikaw ang susunod na developer o AI model na magpapatuloy ng project na ito sa VS Code, basahin ang buong handover documentation dito:
-
-👉 **[PROJECT_HANDOVER.md](PROJECT_HANDOVER.md)**
-
-Naglalaman ito ng:
-1. **Overview & Purpose** ng system
-2. **Directory Structure & Files**
-3. **Cloudflare Deployment Details** & live URLs
-4. **Login Credentials & Password Hash Algorithms**
-5. **Security Implementations** (Brute-force lockout, CSP, XSS, Idle timeout, Session management)
-6. **How to Run, Edit, & Deploy** gamit ang Wrangler CLI
-7. **Future Roadmap** (Server-side Cloudflare D1/KV sync)
-8. **Instructions for Future AI Models** (Prompting context)
+👉 Buong detalye: **[PROJECT_HANDOVER.md](PROJECT_HANDOVER.md)**
 
 ---
 
 ## ⚡ Quick Start
 
-### 1. Default Admin Login
+### Login
 - **Username:** `administrator`
-- **Password:** *(itanong sa system administrator — hindi naka-store sa repo)*
+- **Password:** *(itanong sa system administrator — naka-store bilang Cloudflare secret, wala sa repo)*
 
-### 2. Deploy to Cloudflare Pages
-```powershell
-wrangler pages deploy deploy --project-name sim-inventory
-```
+### Mga command (sa VS Code terminal, sa folder na ito)
+> Kung may error na "running scripts is disabled", gamitin ang `npm.cmd` imbes na `npm`.
+
+| Command | Gagawin |
+|---|---|
+| `npm install` | i-install ang Wrangler (isang beses lang) |
+| `npm run login` | mag-login sa Cloudflare |
+| `npm run deploy` | i-upload ang `deploy/` folder at API sa Cloudflare |
+| `npm run set-password` | palitan ang admin password |
+| `npm run dev` | i-test sa sariling computer (`http://localhost:8788`) |

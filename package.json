@@ -1,0 +1,22 @@
+{
+  "name": "sim-inventory",
+  "version": "2.0.0",
+  "private": true,
+  "description": "SIM Card Inventory - Cloudflare Pages + D1",
+  "scripts": {
+    "set-password": "wrangler pages secret put ADMIN_PASSWORD --project-name sim-inventory",
+    "set-token-secret": "wrangler pages secret put TOKEN_SECRET --project-name sim-inventory",
+    "deploy": "wrangler pages deploy --project-name sim-inventory --branch main --commit-dirty=true",
+    "dev": "wrangler pages dev --port 8788",
+    "db:init": "wrangler d1 execute sim-inventory-db --remote --file=schema.sql",
+    "db:init-local": "wrangler d1 execute sim-inventory-db --local --file=schema.sql",
+    "login": "wrangler login",
+    "whoami": "wrangler whoami"
+  },
+  "devDependencies": {
+    "wrangler": "^3.114.17"
+  },
+  "allowScripts": {
+    "workerd@1.20250718.0": true
+  }
+}

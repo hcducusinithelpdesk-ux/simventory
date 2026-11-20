@@ -1,0 +1,12 @@
+name = "sim-inventory"
+pages_build_output_dir = "deploy"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sim-inventory-db"
+database_id = "5b1d1393-266d-473d-a88a-188f58e848fc"
+
+# Secrets (set with: npx wrangler@3 pages secret put <NAME> --project-name sim-inventory)
+#   ADMIN_PASSWORD  - login password for user "administrator"
+#   TOKEN_SECRET    - random string used to sign session tokens
