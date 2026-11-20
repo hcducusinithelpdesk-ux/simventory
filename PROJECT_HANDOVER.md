@@ -36,7 +36,7 @@ Sim Inventory/
 | Pages project | `sim-inventory` → https://sim-inventory.pages.dev |
 | Production branch | `main` |
 | D1 database | `sim-inventory-db` (binding `DB`, id in `wrangler.toml`) |
-| Secrets | `ADMIN_PASSWORD`, `TOKEN_SECRET` (encrypted, set via Wrangler) |
+| Secrets | `ADMIN_PASSWORD`, `TOKEN_SECRET`, `DATA_KEY` (encrypted, set via Wrangler) |
 | Account | IT helpdesk Cloudflare account — check with `npm run whoami` |
 
 Source code: https://github.com/hcducusinithelpdesk-ux/simventory
@@ -82,13 +82,25 @@ All routes need the Bearer token except login.
 | PUT / DELETE | `/api/brands/:name` | rename / delete brand (delete only if unused) |
 | POST | `/api/clear` | delete everything (used by Restore) |
 
-Uniqueness is enforced by the DB on normalized mobile no. and SIM no. (spaces/dashes removed).
+Uniqueness is enforced by the DB on blind indexes of the normalized mobile no. and SIM no. (spaces/dashes removed).
+
+### Field-level encryption (mobile no., account no., SIM no.)
+- Stored **AES-256-GCM encrypted** in `sims.payload` (one JSON blob per row, row id used as AAD so blobs can't be swapped between rows). Columns `number`, `account`, `sim_no` are always `''`.
+- Key = **`DATA_KEY`** Pages secret (64 hex chars). Sub-keys derived with HKDF: one for AES, one for HMAC blind indexes.
+- **Blind indexes** (HMAC-SHA256, truncated to 192 bits): `number_norm` (mobile), `sim_norm` (SIM no.), `account_idx` (account), `last4_idx` (last 4 digits of mobile). They make search and duplicate checks work without decrypting the table.
+- **Search is exact-match**: full mobile no. (any format: `0917…`, `917…`, `+63917…`, with/without spaces), last 4 digits of mobile, full account no. (case/space/dash-insensitive), full SIM no. (admins only). Partial search like `0917 12` is not possible on encrypted data.
+- **Sorting** by mobile/account/SIM no. is not possible; lists are ordered by date added (Brand and Status columns remain sortable).
+- The API decrypts only the rows it returns (one page, or 1000 per export request).
+- Rows saved before encryption are encrypted automatically by the API on its first request (`ensureEncrypted`, flag `meta.enc_v1 = 1`). Production was migrated on 2026-11-20 (133 SIMs).
+- ⚠️ **If `DATA_KEY` is lost, the numbers cannot be recovered.** A copy is in `backups/DATA_KEY.txt` (git-ignored) — keep another copy offline (password manager / USB). `npm run set-data-key` re-uploads that same key; it never overwrites an existing key file.
+- ⚠️ **Never change `DATA_KEY`** without a re-encryption plan: existing rows would become unreadable ("(hindi ma-decrypt)").
+- Note: files in `backups/*.sql` made before 2026-11-20 16:11 contain **plaintext** numbers; JSON backups/CSV exports from the app are plaintext by design. Store them securely. D1 Time Travel may also retain pre-encryption states for up to 30 days.
 
 ### Scalability design
 - The browser never downloads the whole table: it loads `/api/summary` (tabs/counts) + one page from `/api/sims`.
 - **Per-brand counts** live in `brands.cnt`, maintained by triggers `trg_sims_ai`, `trg_sims_ad`, `trg_sims_au_brand` — so tab counts and unfiltered totals cost no table scan. Never update `brands.cnt` by hand; brand rename moves SIMs via `UPDATE sims` so the triggers move the counts.
-- Indexes: unique `number_norm`, unique `sim_norm`, plus `brand`, `status`, `(brand,status)`, `(brand,number_norm)`, `account`.
-- Search uses `LIKE '%…%'` (substring match on mobile/account/brand, and SIM no. for admins only), which scans rows. Search is debounced (350 ms). Fine for tens of thousands of rows; for millions, add D1 FTS5.
+- Indexes: unique `number_norm`, unique `sim_norm`, plus `account_idx`, `last4_idx`, `brand`, `status`, `(brand,status)`, `(created_at,id)`, `(brand,created_at,id)`.
+- Search = exact match on blind indexes only (all indexed), so it stays fast at any size. Debounced 350 ms.
 - Export/backup use keyset pagination (`id > after`), so they stay fast on big tables.
 - Bulk counts use `RETURNING id` (D1 `meta.changes` also counts rows touched by triggers).
 - Tested locally with 20,000 SIMs: page load ~10 ms, search ~50–80 ms, full export ~0.2 s.
@@ -97,7 +109,7 @@ Uniqueness is enforced by the DB on normalized mobile no. and SIM no. (spaces/da
 ### Migrations
 `schema.sql` = full schema for a new database. Changes to an existing DB go in `migrations/` and are run once:
 `npx wrangler d1 execute sim-inventory-db --remote --file=migrations/<file>.sql`
-(`002_scalability.sql` was applied to production on 2026-11-20.)
+(`002_scalability.sql` and `003_field_encryption.sql` were applied to production on 2026-11-20.)
 
 ---
 

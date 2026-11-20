@@ -214,7 +214,7 @@
   </div>
 
   <div class="toolbar">
-    <input type="search" id="q" placeholder="Hanapin: mobile no., account no., SIM card no....">
+    <input type="search" id="q" placeholder="Hanapin: buong mobile no., huling 4 digits, account no." title="Naka-encrypt ang mga numero, kaya buong numero (o huling 4 digits ng mobile) ang hinahanap">
     <select id="filterBrand" title="Filter by Brand" style="width:auto;min-width:130px">
       <option value="__all">Lahat ng Brand</option>
     </select>
@@ -242,9 +242,9 @@
       <thead>
         <tr>
           <th class="nos">#</th>
-          <th data-k="account">Account No.</th>
-          <th data-k="number">Mobile No.</th>
-          <th data-k="simNo" class="col-adm">Physical SIM Card No.</th>
+          <th class="nos">Account No.</th>
+          <th class="nos">Mobile No.</th>
+          <th class="nos col-adm">Physical SIM Card No.</th>
           <th data-k="brand" class="col-adm">Brand</th>
           <th data-k="status" class="col-adm">Status</th>
           <th class="act edit-only"></th>
@@ -889,7 +889,7 @@ function initApp(){
   var KEY='sim_inventory_v2', BKEY='sim_brands_v2'; // old offline storage (used only for one-time migration)
   var PAGE_SIZES=[50,100,250];
   var data=[], brands=[], brandCounts={}, totalAll=0;
-  var tab='__all', statusFilter='__all', brandFilter='__all', sortKey='number', sortDir=1, editId=null;
+  var tab='__all', statusFilter='__all', brandFilter='__all', sortKey='created', sortDir=1, editId=null;
   var page=1, pages=1, pageSize=100, totalRows=0, loadSeq=0;
   var canEdit=false, curVer=null;
   var pending=null, lossy=false;
@@ -927,7 +927,7 @@ function initApp(){
   function applyMode(){
     document.body.classList.toggle('ro',!canEdit);
     $('modeTxt').textContent='🌐 Online • Shared database'+(canEdit?'':' • View-only');
-    $('q').placeholder=canEdit?'Hanapin: mobile no., account no., SIM card no....':'Hanapin: mobile no. o account no....';
+    $('q').placeholder=canEdit?'Hanapin: buong mobile no., huling 4 digits, buong account no. o SIM no.':'Hanapin: buong mobile no., huling 4 digits, o buong account no.';
   }
 
   // current filters -> query string (shared by page loads and exports)
@@ -1072,7 +1072,7 @@ function initApp(){
     $('count').textContent='Ipinapakita: '+from+'–'+to+' ng '+totalRows+(totalRows!==totalAll?' (kabuuan: '+totalAll+')':'');
     renderPager();
     if(!data.length){
-      $('tbody').innerHTML='<tr><td colspan="7" class="empty">'+(totalAll?'Walang SIM na tumugma sa search/filter.':'Walang SIM na nakita. I-drop ang Excel file sa taas o i-click ang "+ Add SIM".')+'</td></tr>';
+      $('tbody').innerHTML='<tr><td colspan="7" class="empty">'+(totalAll?'Walang SIM na tumugma. Tip: i-type ang buong numero o ang huling 4 digits ng mobile no.':'Walang SIM na nakita. I-drop ang Excel file sa taas o i-click ang "+ Add SIM".')+'</td></tr>';
       return;
     }
     $('tbody').innerHTML=data.map(function(r,i){
@@ -1693,7 +1693,7 @@ function initApp(){
   function showLoading(){$('tbody').innerHTML='<tr><td colspan="7" class="empty">Naglo-load...</td></tr>'}
   // On re-login (possibly a different user/role) start from a clean view
   reloadApp=function(){
-    tab='__all';brandFilter='__all';statusFilter='__all';sortKey='number';sortDir=1;page=1;data=[];
+    tab='__all';brandFilter='__all';statusFilter='__all';sortKey='created';sortDir=1;page=1;data=[];
     $('q').value='';$('filterStatus').value='__all';$('filterBrand').value='__all';
     showLoading();loadRemote().catch(showLoadErr);
   };

@@ -11,7 +11,9 @@
     "db:init": "wrangler d1 execute sim-inventory-db --remote --file=schema.sql",
     "db:init-local": "wrangler d1 execute sim-inventory-db --local --file=schema.sql",
     "login": "wrangler login",
-    "whoami": "wrangler whoami"
+    "whoami": "wrangler whoami",
+    "set-data-key": "node scripts/set-data-key.js",
+    "db:backup": "wrangler d1 export sim-inventory-db --remote --output backups/db_backup.sql"
   },
   "devDependencies": {
     "wrangler": "^3.114.17"

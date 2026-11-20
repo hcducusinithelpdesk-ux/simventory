@@ -16,6 +16,11 @@
 //    PUT    /api/brands/:name     {name}   (rename)
 //    DELETE /api/brands/:name     (only if no SIMs use it)
 //    POST   /api/clear            (delete all SIMs + brands; used by Restore)
+//
+//  Field-level encryption: mobile no., account no. and SIM no. are stored
+//  AES-256-GCM encrypted in sims.payload (key: DATA_KEY secret). Exact-match
+//  search and uniqueness use HMAC blind indexes (number_norm, sim_norm,
+//  account_idx, last4_idx). Plaintext columns number/account/sim_no stay ''.
 // ================================================================
 
 const TOKEN_TTL = 12 * 60 * 60 * 1000; // 12 hours
@@ -137,53 +142,168 @@ function isUniqueErr(e) {
   return /UNIQUE constraint failed/i.test(String(e && e.message));
 }
 
+// ---------- field-level encryption (AES-256-GCM) + blind indexes (HMAC-SHA256) ----------
+// DATA_KEY secret = 64 hex chars (32 random bytes). Two sub-keys are derived with HKDF:
+//   aes  -> encrypts {number, account, simNo} as one JSON blob per row (row id = AAD)
+//   mac  -> blind indexes for exact-match search / uniqueness (domain-separated by kind)
+// LOSING DATA_KEY = LOSING THE NUMBERS. Keep a copy somewhere safe.
+let _keys = null, _keysFor = null;
+function hexToBytes(h) {
+  h = String(h || '').trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(h)) throw new Error('DATA_KEY must be 64 hex characters');
+  return Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
+}
+async function getKeys(env) {
+  if (_keys && _keysFor === env.DATA_KEY) return _keys;
+  const base = await crypto.subtle.importKey('raw', hexToBytes(env.DATA_KEY), 'HKDF', false, ['deriveKey']);
+  const hk = (info) => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: enc.encode(info) });
+  const aes = await crypto.subtle.deriveKey(hk('sim-inventory/aes-gcm/v1'), base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const mac = await crypto.subtle.deriveKey(hk('sim-inventory/blind-index/v1'), base, { name: 'HMAC', hash: 'SHA-256', length: 256 }, false, ['sign']);
+  _keys = { aes, mac };
+  _keysFor = env.DATA_KEY;
+  return _keys;
+}
+// blind index: kind = 'n' (mobile), 's' (SIM no.), 'a' (account), 'l4' (last 4 digits of mobile)
+async function bidx(keys, kind, value) {
+  if (!value) return '';
+  const sig = await crypto.subtle.sign('HMAC', keys.mac, enc.encode(kind + ':' + value));
+  return b64url(new Uint8Array(sig)).slice(0, 32); // 192 bits
+}
+async function seal(keys, id, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(id) }, keys.aes, enc.encode(JSON.stringify(obj)));
+  return 'v1.' + b64url(iv) + '.' + b64url(new Uint8Array(ct));
+}
+async function unseal(keys, id, s) {
+  const [v, iv, ct] = String(s).split('.');
+  if (v !== 'v1') throw new Error('unknown payload version');
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64urlDecode(iv), additionalData: enc.encode(id) }, keys.aes, b64urlDecode(ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+const digitsOnly = (s) => String(s || '').replace(/\D/g, '');
+function validMobile(s) {
+  s = String(s == null ? '' : s).trim();
+  if (!s || !/^[\d\s\-+().]+$/.test(s)) return '';
+  const d = s.replace(/\D/g, '');
+  if (/^09\d{9}$/.test(d)) return d;
+  if (/^9\d{9}$/.test(d)) return '0' + d;
+  if (/^639\d{9}$/.test(d)) return '0' + d.slice(2);
+  return '';
+}
+// all encrypted/indexed column values for one record
+async function encFields(keys, id, r) {
+  const d = digitsOnly(r.number);
+  const [payload, n, s, a, l4] = await Promise.all([
+    seal(keys, id, { number: r.number, account: r.account, simNo: r.simNo }),
+    bidx(keys, 'n', norm(r.number)),
+    r.simNo ? bidx(keys, 's', norm(r.simNo)) : '',
+    r.account ? bidx(keys, 'a', norm(r.account)) : '',
+    d.length >= 4 ? bidx(keys, 'l4', d.slice(-4)) : '',
+  ]);
+  return { payload, n, s, a, l4 };
+}
+async function insertStmt(db, keys, id, r, orIgnore) {
+  const f = await encFields(keys, id, r);
+  return db
+    .prepare(
+      'INSERT ' + (orIgnore ? 'OR IGNORE ' : '') +
+        "INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status, payload, account_idx, last4_idx) VALUES (?1,'',?2,'','',?3,?4,?5,?6,?7,?8)" +
+        (orIgnore ? ' RETURNING id' : '')
+    )
+    .bind(id, f.n, f.s, r.brand, r.status, f.payload, f.a, f.l4);
+}
+async function updateStmt(db, keys, id, r, orIgnore) {
+  const f = await encFields(keys, id, r);
+  return db
+    .prepare(
+      'UPDATE ' + (orIgnore ? 'OR IGNORE ' : '') +
+        "sims SET number='', number_norm=?2, account='', sim_no='', sim_norm=?3, brand=?4, status=?5, payload=?6, account_idx=?7, last4_idx=?8, updated_at=datetime('now') WHERE id=?1" +
+        (orIgnore ? ' RETURNING id' : '')
+    )
+    .bind(id, f.n, f.s, r.brand, r.status, f.payload, f.a, f.l4);
+}
+const ROW_COLS = 'id, payload, number, account, sim_no, brand, status';
+// decrypt DB rows -> API rows. Viewers never receive SIM card no.
+async function decodeRows(keys, rows, isAdmin) {
+  return Promise.all(
+    rows.map(async (row) => {
+      let p;
+      if (row.payload) {
+        try { p = await unseal(keys, row.id, row.payload); } catch (e) { p = { number: '(hindi ma-decrypt)', account: '', simNo: '' }; }
+      } else {
+        p = { number: row.number, account: row.account, simNo: row.sim_no }; // not yet migrated
+      }
+      const out = { id: row.id, number: p.number || '', account: p.account || '', brand: row.brand, status: row.status };
+      if (isAdmin) out.simNo = p.simNo || '';
+      return out;
+    })
+  );
+}
+// One-time migration of rows saved before encryption existed (runs in batches, cached per isolate).
+let _encDone = false;
+async function ensureEncrypted(db, keys) {
+  if (_encDone) return;
+  const flag = await db.prepare("SELECT v FROM meta WHERE k = 'enc_v1'").first();
+  if (flag && flag.v === 1) { _encDone = true; return; }
+  for (let round = 0; round < 10; round++) {
+    const r = await db.prepare('SELECT id, number, account, sim_no AS simNo FROM sims WHERE payload IS NULL LIMIT 200').all();
+    if (!r.results.length) {
+      await db.prepare("INSERT INTO meta (k, v) VALUES ('enc_v1', 1) ON CONFLICT(k) DO UPDATE SET v = 1").run();
+      _encDone = true;
+      return;
+    }
+    const stmts = [];
+    for (const row of r.results) {
+      const f = await encFields(keys, row.id, { number: row.number, account: row.account, simNo: row.simNo });
+      stmts.push(
+        db
+          .prepare("UPDATE sims SET payload=?2, number='', account='', sim_no='', number_norm=?3, sim_norm=?4, account_idx=?5, last4_idx=?6 WHERE id=?1 AND payload IS NULL")
+          .bind(row.id, f.payload, f.n, f.s, f.a, f.l4)
+      );
+    }
+    await db.batch(stmts);
+  }
+}
+
 // ---------- query helpers (pagination / search / filters) ----------
 const MAX_PAGE = 250;
-const EXPORT_PAGE = 2000;
+const EXPORT_PAGE = 1000;
 const MAX_LOOKUP = 1000;
-const ADMIN_COLS = 'id, number, account, sim_no AS simNo, brand, status';
-const VIEWER_COLS = 'id, number, account, brand, status'; // viewers never receive SIM card no.
 
-function likeEsc(s) {
-  return '%' + String(s).replace(/[\\%_]/g, (c) => '\\' + c) + '%';
-}
-// Build WHERE clause from query params. Viewers cannot search by SIM card no.
-function buildFilter(sp, isAdmin) {
+// Build WHERE clause. Search is exact-match on blind indexes (all indexed -> fast at any size):
+//   full mobile no. (any format: 0917..., 917..., +63917...), last 4 digits of mobile,
+//   full account no., and (admins only) full SIM card no.
+async function buildFilter(sp, isAdmin, keys) {
   const conds = [], args = [];
   const brand = clean(sp.get('brand'), 40);
   const status = sp.get('status') === 'Active' || sp.get('status') === 'Inactive' ? sp.get('status') : '';
-  const q = clean(sp.get('q'), 60).toLowerCase();
+  const q = clean(sp.get('q'), 60);
   if (brand) { conds.push('brand = ?'); args.push(brand); }
   if (status) { conds.push('status = ?'); args.push(status); }
   if (q) {
-    const ql = likeEsc(q), qn = likeEsc(norm(q) || q);
-    const parts = [
-      "lower(number) LIKE ? ESCAPE '\\'",
-      "number_norm LIKE ? ESCAPE '\\'",
-      "lower(account) LIKE ? ESCAPE '\\'",
-      "replace(replace(lower(account),' ',''),'-','') LIKE ? ESCAPE '\\'",
-      "lower(brand) LIKE ? ESCAPE '\\'",
-    ];
-    args.push(ql, qn, ql, qn, ql);
-    if (isAdmin) {
-      parts.push("lower(sim_no) LIKE ? ESCAPE '\\'", "sim_norm LIKE ? ESCAPE '\\'");
-      args.push(ql, qn);
-    }
+    const qn = norm(q), mob = validMobile(q);
+    const parts = ['number_norm = ?', 'account_idx = ?'];
+    args.push(await bidx(keys, 'n', mob || qn), await bidx(keys, 'a', qn));
+    if (/^\d{4}$/.test(qn)) { parts.push('last4_idx = ?'); args.push(await bidx(keys, 'l4', qn)); }
+    if (isAdmin) { parts.push('sim_norm = ?'); args.push(await bidx(keys, 's', qn)); }
     conds.push('(' + parts.join(' OR ') + ')');
   }
   return { where: conds.length ? ' WHERE ' + conds.join(' AND ') : '', args, brand, status, hasSearch: !!q };
 }
-function sortColumn(key, isAdmin) {
-  const map = { number: 'number_norm', account: 'account', brand: 'brand', status: 'status' };
-  if (isAdmin) map.simNo = 'sim_norm';
-  return map[key] || 'number_norm';
+// encrypted columns can't be sorted in SQL -> they sort by date added
+function sortColumn(key) {
+  const map = { brand: 'brand', status: 'status', created: 'created_at' };
+  return map[key] || 'created_at';
 }
-async function dupErr(db, r, selfId) {
-  const c = await db
-    .prepare("SELECT number, brand FROM sims WHERE (number_norm = ?1 OR (?2 <> '' AND sim_norm = ?2)) AND id <> ?3 LIMIT 1")
-    .bind(norm(r.number), norm(r.simNo), selfId)
+async function dupErr(db, keys, r, selfId) {
+  const n = await bidx(keys, 'n', norm(r.number));
+  const s = r.simNo ? await bidx(keys, 's', norm(r.simNo)) : '';
+  const row = await db
+    .prepare("SELECT " + ROW_COLS + " FROM sims WHERE (number_norm = ?1 OR (?2 <> '' AND sim_norm = ?2)) AND id <> ?3 LIMIT 1")
+    .bind(n, s, selfId)
     .first();
-  return json({ error: 'Duplicate', conflict: c || null }, 409);
+  const c = row ? (await decodeRows(keys, [row], true))[0] : null;
+  return json({ error: 'Duplicate', conflict: c ? { number: c.number, brand: c.brand } : null }, 409);
 }
 
 // ---------- login ----------
@@ -263,11 +383,14 @@ export async function onRequest(context) {
   const parts = (params.route || []).map((p) => decodeURIComponent(p));
   const [res, id] = parts;
 
-  if (!db || !env.ADMIN_PASSWORD || !env.TOKEN_SECRET) {
+  if (!db || !env.ADMIN_PASSWORD || !env.TOKEN_SECRET || !env.DATA_KEY) {
     return err(500, 'Server not configured (missing DB binding or secrets).');
   }
 
   try {
+    const keys = await getKeys(env);
+    await ensureEncrypted(db, keys); // one-time: encrypt any plaintext rows left from before encryption
+
     if (res === 'login' && method === 'POST') return await handleLogin(request, env);
 
     // --- auth required beyond this point ---
@@ -290,12 +413,11 @@ export async function onRequest(context) {
     // GET /api/sims?q=&brand=&status=&sort=&dir=&page=&size=  (all roles) — one page
     if (res === 'sims' && method === 'GET' && !id) {
       const url = new URL(request.url);
-      const f = buildFilter(url.searchParams, isAdmin);
-      const sortCol = sortColumn(url.searchParams.get('sort'), isAdmin);
+      const f = await buildFilter(url.searchParams, isAdmin, keys);
+      const sortCol = sortColumn(url.searchParams.get('sort'));
       const dir = url.searchParams.get('dir') === 'desc' ? 'DESC' : 'ASC';
       const size = Math.min(MAX_PAGE, Math.max(1, parseInt(url.searchParams.get('size'), 10) || 100));
       const page = Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1);
-      const cols = isAdmin ? ADMIN_COLS : VIEWER_COLS;
 
       // total: use maintained counters when possible (no table scan)
       let total;
@@ -311,10 +433,11 @@ export async function onRequest(context) {
       const pages = Math.max(1, Math.ceil(total / size));
       const p = Math.min(page, pages);
       const rows = await db
-        .prepare('SELECT ' + cols + ' FROM sims' + f.where + ' ORDER BY ' + sortCol + ' ' + dir + ', id ' + dir + ' LIMIT ? OFFSET ?')
+        .prepare('SELECT ' + ROW_COLS + ' FROM sims' + f.where + ' ORDER BY ' + sortCol + ' ' + dir + ', id ' + dir + ' LIMIT ? OFFSET ?')
         .bind(...f.args, size, (p - 1) * size)
         .all();
-      return json({ items: rows.results, total, page: p, pages, size, ver: await getVer(db) });
+      const items = await decodeRows(keys, rows.results, isAdmin);
+      return json({ items, total, page: p, pages, size, ver: await getVer(db) });
     }
 
     // ---------- everything below is admin-only ----------
@@ -382,32 +505,35 @@ export async function onRequest(context) {
     // GET /api/export?<filters>&after=<id>&limit=  — keyset-paged full dump for CSV / backup
     if (res === 'export' && method === 'GET') {
       const url = new URL(request.url);
-      const f = buildFilter(url.searchParams, true);
+      const f = await buildFilter(url.searchParams, true, keys);
       const limit = Math.min(EXPORT_PAGE, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || EXPORT_PAGE));
       const after = url.searchParams.get('after') || '';
       const where = f.where ? f.where + ' AND id > ?' : ' WHERE id > ?';
       const rows = await db
-        .prepare('SELECT ' + ADMIN_COLS + ' FROM sims' + where + ' ORDER BY id LIMIT ?')
+        .prepare('SELECT ' + ROW_COLS + ' FROM sims' + where + ' ORDER BY id LIMIT ?')
         .bind(...f.args, after, limit)
         .all();
-      const items = rows.results;
+      const items = await decodeRows(keys, rows.results, true);
       return json({ items, next: items.length === limit ? items[items.length - 1].id : null });
     }
 
     // POST /api/lookup {numbers:[...], sims:[...]} — find existing SIMs for import preview
+    // (client sends normalized plaintext; we compare blind indexes and return decrypted rows)
     if (res === 'lookup' && method === 'POST') {
       const b = await body(request);
       const nums = (Array.isArray(b.numbers) ? b.numbers : []).map(norm).filter(Boolean).slice(0, MAX_LOOKUP);
       const sims = (Array.isArray(b.sims) ? b.sims : []).map(norm).filter(Boolean).slice(0, MAX_LOOKUP);
+      const [nh, sh] = await Promise.all([Promise.all(nums.map((x) => bidx(keys, 'n', x))), Promise.all(sims.map((x) => bidx(keys, 's', x)))]);
       const r = await db
         .prepare(
-          'SELECT ' + ADMIN_COLS + ', number_norm AS numberNorm, sim_norm AS simNorm FROM sims ' +
+          'SELECT ' + ROW_COLS + ' FROM sims ' +
             'WHERE number_norm IN (SELECT value FROM json_each(?1)) ' +
             "OR (sim_norm <> '' AND sim_norm IN (SELECT value FROM json_each(?2)))"
         )
-        .bind(JSON.stringify(nums), JSON.stringify(sims))
+        .bind(JSON.stringify(nh), JSON.stringify(sh))
         .all();
-      return json({ items: r.results });
+      const items = (await decodeRows(keys, r.results, true)).map((x) => ({ ...x, numberNorm: norm(x.number), simNorm: norm(x.simNo) }));
+      return json({ items });
     }
 
     // /api/sims (write)
@@ -416,14 +542,9 @@ export async function onRequest(context) {
         const r = cleanRec(await body(request));
         if (!r.number || !r.brand) return err(400, 'Kailangan ang Mobile No. at Brand.');
         try {
-          await db.batch([
-            db
-              .prepare('INSERT INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)')
-              .bind(uid(), r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status),
-            bumpVer(db),
-          ]);
+          await db.batch([await insertStmt(db, keys, uid(), r, false), bumpVer(db)]);
         } catch (e) {
-          if (isUniqueErr(e)) return dupErr(db, r, '');
+          if (isUniqueErr(e)) return dupErr(db, keys, r, '');
           throw e;
         }
         return json({ ok: true });
@@ -433,14 +554,9 @@ export async function onRequest(context) {
         if (!r.number || !r.brand) return err(400, 'Kailangan ang Mobile No. at Brand.');
         let out;
         try {
-          out = await db.batch([
-            db
-              .prepare("UPDATE sims SET number=?2, number_norm=?3, account=?4, sim_no=?5, sim_norm=?6, brand=?7, status=?8, updated_at=datetime('now') WHERE id=?1")
-              .bind(id, r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status),
-            bumpVer(db),
-          ]);
+          out = await db.batch([await updateStmt(db, keys, id, r, false), bumpVer(db)]);
         } catch (e) {
-          if (isUniqueErr(e)) return dupErr(db, r, id);
+          if (isUniqueErr(e)) return dupErr(db, keys, r, id);
           throw e;
         }
         if (!out[0].meta.changes) return err(404, 'Hindi nahanap ang SIM.');
@@ -464,21 +580,9 @@ export async function onRequest(context) {
       const newBrands = Array.isArray(b.brands) ? b.brands.map((x) => clean(x, 40)).filter(Boolean) : [];
       const stmts = newBrands.map((name) => ensureBrand(db, name));
       const firstIns = stmts.length;
-      items.forEach((r) =>
-        stmts.push(
-          db
-            .prepare('INSERT OR IGNORE INTO sims (id, number, number_norm, account, sim_no, sim_norm, brand, status) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) RETURNING id')
-            .bind(uid(), r.number, norm(r.number), r.account, r.simNo, norm(r.simNo), r.brand, r.status)
-        )
-      );
+      stmts.push(...(await Promise.all(items.map((r) => insertStmt(db, keys, uid(), r, true)))));
       const firstUpd = stmts.length;
-      updates.forEach((u) =>
-        stmts.push(
-          db
-            .prepare("UPDATE OR IGNORE sims SET number=?2, number_norm=?3, account=?4, sim_no=?5, sim_norm=?6, brand=?7, status=?8, updated_at=datetime('now') WHERE id=?1 RETURNING id")
-            .bind(u.id, u.number, norm(u.number), u.account, u.simNo, norm(u.simNo), u.brand, u.status)
-        )
-      );
+      stmts.push(...(await Promise.all(updates.map((u) => updateStmt(db, keys, u.id, u, true)))));
       stmts.push(bumpVer(db));
       const out = await db.batch(stmts);
       let inserted = 0, updated = 0;

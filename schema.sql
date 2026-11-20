@@ -1,11 +1,14 @@
 -- SIM Inventory D1 schema
 CREATE TABLE IF NOT EXISTS sims (
   id          TEXT PRIMARY KEY,
-  number      TEXT NOT NULL,
-  number_norm TEXT NOT NULL,
-  account     TEXT NOT NULL DEFAULT '',
-  sim_no      TEXT NOT NULL DEFAULT '',
-  sim_norm    TEXT NOT NULL DEFAULT '',
+  number      TEXT NOT NULL,              -- '' (encrypted in payload)
+  number_norm TEXT NOT NULL,              -- HMAC blind index of mobile no.
+  account     TEXT NOT NULL DEFAULT '',   -- '' (encrypted in payload)
+  sim_no      TEXT NOT NULL DEFAULT '',   -- '' (encrypted in payload)
+  sim_norm    TEXT NOT NULL DEFAULT '',   -- HMAC blind index of SIM no. ('' if none)
+  payload     TEXT,                       -- AES-256-GCM {number, account, simNo}
+  account_idx TEXT NOT NULL DEFAULT '',   -- HMAC blind index of account no.
+  last4_idx   TEXT NOT NULL DEFAULT '',   -- HMAC blind index of last 4 digits
   brand       TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'Active',
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -27,6 +30,7 @@ CREATE TABLE IF NOT EXISTS meta (
   v INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO meta (k, v) VALUES ('ver', 1);
+INSERT OR IGNORE INTO meta (k, v) VALUES ('enc_v1', 1); -- new DBs start encrypted
 
 -- login audit log
 CREATE TABLE IF NOT EXISTS auth_log (
@@ -77,6 +81,9 @@ END;
 
 CREATE INDEX IF NOT EXISTS ix_sims_status       ON sims(status);
 CREATE INDEX IF NOT EXISTS ix_sims_brand_status ON sims(brand, status);
-CREATE INDEX IF NOT EXISTS ix_sims_brand_number ON sims(brand, number_norm);
-CREATE INDEX IF NOT EXISTS ix_sims_account      ON sims(account);
+CREATE INDEX IF NOT EXISTS ix_sims_account_idx   ON sims(account_idx);
+CREATE INDEX IF NOT EXISTS ix_sims_last4         ON sims(last4_idx);
+CREATE INDEX IF NOT EXISTS ix_sims_created       ON sims(created_at, id);
+CREATE INDEX IF NOT EXISTS ix_sims_brand_created ON sims(brand, created_at, id);
+CREATE INDEX IF NOT EXISTS ix_sims_payload_null  ON sims(id) WHERE payload IS NULL;
 
