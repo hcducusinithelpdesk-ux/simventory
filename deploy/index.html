@@ -66,6 +66,15 @@
   .pv table{min-width:0;font-size:13px}
   .pv th,.pv td{padding:6px 10px;cursor:default}
   body.ro .edit-only{display:none!important}
+  /* Viewer role: only Mobile No. + Account No. columns */
+  body.ro .col-adm{display:none!important}
+  .role-tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;opacity:.85;margin-left:4px}
+  #usersDlg table{min-width:0;font-size:13px}
+  #usersDlg th,#usersDlg td{padding:7px 10px;cursor:default}
+  #usersDlg .inactive td{opacity:.5}
+  .uform{display:grid;grid-template-columns:1fr 1fr 130px auto;gap:8px;align-items:end;margin-top:12px}
+  .uform label{margin:0 0 3px}
+  @media (max-width:600px){.uform{grid-template-columns:1fr}}
   @media print{header,.tabs .tab:not(.active),.toolbar,.note,.drop,td.act,th.act,#addBrand{display:none}}
 
   /* ========== Login Page Styles ========== */
@@ -215,11 +224,11 @@
     <button class="edit-only" id="btnRenameBrand">✏ Rename Brand</button>
     <button class="edit-only" id="btnImport">📥 Import Excel/CSV</button>
     <button class="edit-only" id="btnPaste">📋 Paste from Excel</button>
-    <button id="btnTemplate">⬇ Download Template</button>
-    <button id="btnCsv">Export CSV</button>
-    <button id="btnBackup">Backup (JSON)</button>
+    <button class="edit-only" id="btnTemplate">⬇ Download Template</button>
+    <button class="edit-only" id="btnCsv">Export CSV</button>
+    <button class="edit-only" id="btnBackup">Backup (JSON)</button>
     <button class="edit-only" id="btnRestore">Restore</button>
-    <button onclick="window.print()">Print</button>
+    <button class="edit-only" id="btnPrint">Print</button>
     <input type="file" id="fileImp" accept=".xlsx,.csv,.tsv,.txt" hidden>
     <input type="file" id="fileJson" accept=".json" hidden>
   </div>
@@ -232,9 +241,9 @@
           <th class="nos">#</th>
           <th data-k="account">Account No.</th>
           <th data-k="number">Mobile No.</th>
-          <th data-k="simNo">Physical SIM Card No.</th>
-          <th data-k="brand">Brand</th>
-          <th data-k="status">Status</th>
+          <th data-k="simNo" class="col-adm">Physical SIM Card No.</th>
+          <th data-k="brand" class="col-adm">Brand</th>
+          <th data-k="status" class="col-adm">Status</th>
           <th class="act edit-only"></th>
         </tr>
       </thead>
@@ -316,6 +325,25 @@
     <div class="actions">
       <button type="button" id="secLogClose">Close</button>
     </div>
+  </div>
+</dialog>
+
+<!-- ========== User Management Dialog (admin only) ========== -->
+<dialog id="usersDlg" class="wide">
+  <div class="box">
+    <h2>👥 Users</h2>
+    <p class="note" style="margin:0 0 10px"><b>Administrator</b> — buong access (add/edit/delete/import/export, users).<br><b>Viewer</b> — Mobile No. at Account No. lang ang nakikita; puwedeng mag-search at mag-filter.</p>
+    <div class="pv" style="max-height:260px"><table>
+      <thead><tr><th>Username</th><th>Role</th><th>Status</th><th></th></tr></thead>
+      <tbody id="usersList"></tbody>
+    </table></div>
+    <div class="uform">
+      <div><label>Bagong username</label><input id="uName" autocomplete="off" placeholder="hal. juan.viewer"></div>
+      <div><label>Password (8+ characters)</label><input id="uPass" type="password" autocomplete="new-password"></div>
+      <div><label>Role</label><select id="uRole"><option value="viewer">Viewer</option><option value="admin">Administrator</option></select></div>
+      <button type="button" class="primary" id="uAdd">+ Add User</button>
+    </div>
+    <div class="actions"><button type="button" id="usersClose">Close</button></div>
   </div>
 </dialog>
 
@@ -430,9 +458,10 @@
 
   // ========== Session Management ==========
   // token = signed by the server (/api/login); sent as "Authorization: Bearer <token>"
-  function createSession(username, token, serverExpiresAt){
+  function createSession(username, token, serverExpiresAt, role){
     var session = {
       token: token,
+      role: role === 'admin' ? 'admin' : 'viewer',
       serverExpiresAt: serverExpiresAt,
       username: username,
       createdAt: Date.now(),
@@ -588,7 +617,7 @@
       if(res.ok && j.token){
         // Successful login
         resetAttempts();
-        var session = createSession(j.username || username, j.token, j.expiresAt);
+        var session = createSession(j.username || username, j.token, j.expiresAt, j.role);
         showApp(session);
       } else if(res.status === 429 && j.lockedUntil){
         // Locked out by server (too many failed attempts from this IP)
@@ -620,10 +649,15 @@
     $('appContent').style.display = 'block';
 
     // Inject auth controls into header
-    var authHtml = '<span id="modeTxt">Offline • Naka-save sa browser na ito</span>' +
-      ' <span class="user-badge">👤 ' + escHtml(session.username) + '</span>' +
+    var isAdmin = session.role === 'admin';
+    // Hide admin-only UI immediately (server enforces it regardless)
+    document.body.classList.toggle('ro', !isAdmin);
+    var authHtml = '<span id="modeTxt">🌐 Online</span>' +
+      ' <span class="user-badge">👤 ' + escHtml(session.username) +
+      ' <span class="role-tag">' + (isAdmin ? 'Admin' : 'Viewer') + '</span></span>' +
       ' <span class="session-time" id="sessionTimeDisplay">⏱ --:--</span>' +
-      ' <button id="btnSecLog" title="Security Log">🛡️</button>' +
+      (isAdmin ? ' <button id="btnUsers" title="Manage users">👥 Users</button>' +
+                 ' <button id="btnSecLog" title="Security Log">🛡️</button>' : '') +
       ' <button id="btnLogout" title="Logout">🔒 Logout</button>' +
       ' <button id="btnLogin" class="sm" hidden style="margin-left:8px">🔒 Login para mag-edit</button>';
     $('headerAuth').innerHTML = authHtml;
@@ -631,8 +665,11 @@
     // Bind logout button
     $('btnLogout').onclick = function(){ performLogout() };
 
-    // Bind security log button
-    $('btnSecLog').onclick = function(){ showSecurityLog() };
+    // Admin-only buttons
+    if(isAdmin){
+      $('btnSecLog').onclick = function(){ showSecurityLog() };
+      $('btnUsers').onclick = function(){ showUsers() };
+    }
 
     // Start idle tracking
     setupIdleTracking();
@@ -709,6 +746,85 @@
   }
   $('secLogClose').onclick = function(){ $('secLogDlg').close() };
 
+  // ========== User Management (admin only) ==========
+  async function authFetch(method, path, body){
+    var s = getSession();
+    var res = await fetch(path, {
+      method: method,
+      headers: {'Content-Type':'application/json','Authorization':'Bearer ' + (s && s.token || '')},
+      body: body ? JSON.stringify(body) : undefined,
+      cache: 'no-store'
+    });
+    var j = {}; try{ j = await res.json() }catch(e){}
+    if(res.status === 401){ document.querySelectorAll('dialog[open]').forEach(function(d){d.close()}); performLogout('Session expired. Please sign in again.'); }
+    if(!res.ok){ var e = new Error(j.error || ('Error ' + res.status)); e.status = res.status; throw e; }
+    return j;
+  }
+  async function loadUsers(){
+    var list = $('usersList');
+    list.innerHTML = '<tr><td colspan="4" class="empty">Naglo-load...</td></tr>';
+    var j;
+    try{ j = await authFetch('GET', '/api/users') }
+    catch(e){ list.innerHTML = '<tr><td colspan="4" class="empty">' + escHtml(e.message) + '</td></tr>'; return; }
+    var rows = '<tr><td><b>' + escHtml(j.builtin) + '</b></td><td>Administrator</td><td>Active</td><td class="note" style="margin:0">built-in (password sa Cloudflare secret)</td></tr>';
+    rows += (j.users || []).map(function(u){
+      var n = escHtml(u.username);
+      return '<tr class="' + (u.active ? '' : 'inactive') + '"><td>' + n + '</td>' +
+        '<td><select data-urole="' + n + '" style="width:auto;padding:4px 6px">' +
+          '<option value="viewer"' + (u.role === 'viewer' ? ' selected' : '') + '>Viewer</option>' +
+          '<option value="admin"' + (u.role === 'admin' ? ' selected' : '') + '>Administrator</option></select></td>' +
+        '<td>' + (u.active ? 'Active' : 'Disabled') + '</td>' +
+        '<td style="text-align:right;white-space:nowrap">' +
+          '<button class="sm" data-upw="' + n + '">🔑 Reset PW</button> ' +
+          '<button class="sm" data-uact="' + n + '" data-on="' + (u.active ? '0' : '1') + '">' + (u.active ? '⏸ Disable' : '▶ Enable') + '</button> ' +
+          '<button class="sm danger" data-udel="' + n + '">🗑</button></td></tr>';
+    }).join('');
+    list.innerHTML = rows;
+    list.querySelectorAll('[data-urole]').forEach(function(el){
+      el.onchange = function(){
+        authFetch('PUT', '/api/users/' + encodeURIComponent(el.getAttribute('data-urole')), {role: el.value})
+          .then(loadUsers).catch(function(e){ alert(e.message); loadUsers(); });
+      };
+    });
+    list.querySelectorAll('[data-upw]').forEach(function(el){
+      el.onclick = function(){
+        var u = el.getAttribute('data-upw');
+        var p = prompt('Bagong password para kay "' + u + '" (8+ characters):');
+        if(p === null) return;
+        authFetch('PUT', '/api/users/' + encodeURIComponent(u), {password: p})
+          .then(function(){ alert('Napalitan ang password ni ' + u + '.'); }).catch(function(e){ alert(e.message) });
+      };
+    });
+    list.querySelectorAll('[data-uact]').forEach(function(el){
+      el.onclick = function(){
+        authFetch('PUT', '/api/users/' + encodeURIComponent(el.getAttribute('data-uact')), {active: el.getAttribute('data-on') === '1'})
+          .then(loadUsers).catch(function(e){ alert(e.message) });
+      };
+    });
+    list.querySelectorAll('[data-udel]').forEach(function(el){
+      el.onclick = function(){
+        var u = el.getAttribute('data-udel');
+        if(!confirm('I-delete ang user na "' + u + '"?')) return;
+        authFetch('DELETE', '/api/users/' + encodeURIComponent(u)).then(loadUsers).catch(function(e){ alert(e.message) });
+      };
+    });
+  }
+  function showUsers(){
+    $('uName').value = ''; $('uPass').value = ''; $('uRole').value = 'viewer';
+    $('usersDlg').showModal();
+    loadUsers();
+  }
+  $('uAdd').onclick = function(){
+    var name = $('uName').value.trim(), pw = $('uPass').value, role = $('uRole').value;
+    if(!name || !pw){ alert('Ilagay ang username at password.'); return; }
+    $('uAdd').disabled = true;
+    authFetch('POST', '/api/users', {username: name, password: pw, role: role})
+      .then(function(){ $('uName').value = ''; $('uPass').value = ''; return loadUsers(); })
+      .catch(function(e){ alert(e.message) })
+      .then(function(){ $('uAdd').disabled = false; });
+  };
+  $('usersClose').onclick = function(){ $('usersDlg').close() };
+
   // ========== Login UI Event Bindings ==========
   $('loginBtn').onclick = handleLogin;
   $('loginUser').addEventListener('keydown', function(e){ if(e.key==='Enter') $('loginPass').focus() });
@@ -784,12 +900,14 @@ function initApp(){
   }
   function errMsg(e){
     if(e&&e.status===401)return 'Nag-expire ang session. Mag-login ulit.';
+    if(e&&e.status===403)return 'Bawal: pang-administrator lang ito. Viewer ang account mo.';
     if(e&&e.status===409)return 'May kapareho na ang Mobile No. o SIM Card No. na ito.';
     return (e&&e.message)||'May error. Subukan ulit.';
   }
   function applyMode(){
     document.body.classList.toggle('ro',ONLINE&&!canEdit);
     $('modeTxt').textContent='🌐 Online • Shared database'+(canEdit?'':' • View-only');
+    $('q').placeholder=canEdit?'Hanapin: mobile no., account no., SIM card no....':'Hanapin: mobile no. o account no....';
     var bl=$('btnLogin');if(bl){bl.hidden=!protectedMode;
     bl.textContent=canEdit?'🔓 Logout':'🔒 Login para mag-edit';}
   }
@@ -957,9 +1075,9 @@ function initApp(){
       return '<tr><td class="n">'+(i+1)+'</td>'+
         '<td>'+esc(r.account)+'</td>'+
         '<td><b>'+esc(r.number)+'</b></td>'+
-        '<td>'+esc(r.simNo)+'</td>'+
-        '<td>'+esc(r.brand)+'</td>'+
-        '<td>'+esc(normalizeStatus(r.status))+'</td>'+
+        '<td class="col-adm">'+esc(r.simNo)+'</td>'+
+        '<td class="col-adm">'+esc(r.brand)+'</td>'+
+        '<td class="col-adm">'+esc(normalizeStatus(r.status))+'</td>'+
         '<td class="act edit-only" style="text-align:right">'+(canEdit?'<button class="sm" data-e="'+esc(r.id)+'">✏ Edit</button> <button class="sm danger" data-d="'+esc(r.id)+'">🗑 Delete</button>':'')+'</td></tr>';
     }).join('');
     Array.prototype.forEach.call(document.querySelectorAll('[data-e]'),function(b){b.onclick=function(){openForm(b.getAttribute('data-e'))}});
@@ -1475,6 +1593,7 @@ function initApp(){
     download('sim_inventory_'+(tab==='__all'?'lahat':tab)+'_'+today()+'.csv','\ufeff'+lines.join('\r\n'),'text/csv;charset=utf-8');
   };
 
+  $('btnPrint').onclick=function(){window.print()};
   $('btnTemplate').onclick=function(){
     var template='Mobile No.,Account No.,Physical SIM Card No.,Brand,Status\r\n';
     download('SIM_Inventory_Template.csv','\ufeff'+template,'text/csv;charset=utf-8');
@@ -1513,7 +1632,7 @@ function initApp(){
     // One-time: offer to upload SIMs that were saved in this browser (old offline version)
     async function migrateLocal(){
       var MIG='sim_migrated_to_server_v1';
-      if(curVer===null)return; // server data didn't load
+      if(curVer===null||!canEdit)return; // server data didn't load, or viewer account
       try{if(localStorage.getItem(MIG))return}catch(e){return}
       var local=read(KEY);
       if(!Array.isArray(local)||!local.length){try{localStorage.setItem(MIG,'1')}catch(e){}return}

@@ -44,4 +44,16 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   locked_until INTEGER NOT NULL DEFAULT 0
 );
 
+-- user accounts (RBAC). The built-in "administrator" account is NOT stored here;
+-- it is checked against the ADMIN_PASSWORD secret so it can never be locked out.
+CREATE TABLE IF NOT EXISTS users (
+  username   TEXT PRIMARY KEY,          -- stored lowercase
+  role       TEXT NOT NULL CHECK (role IN ('admin','viewer')),
+  pw_salt    TEXT NOT NULL,
+  pw_hash    TEXT NOT NULL,             -- PBKDF2-SHA256, 100k iterations
+  active     INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 INSERT OR IGNORE INTO brands (name, pos) VALUES ('Globe', 1), ('Smart', 2);

@@ -70,6 +70,18 @@ async function verifyToken(token, secret) {
     return null;
   }
 }
+// ---------- password hashing for DB users (PBKDF2-SHA256) ----------
+const PBKDF2_ITER = 100000; // Workers maximum
+const toHex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+async function hashPassword(password, saltHex) {
+  const salt = saltHex ? Uint8Array.from(saltHex.match(/../g).map((h) => parseInt(h, 16))) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITER }, key, 256);
+  return { salt: toHex(salt), hash: toHex(new Uint8Array(bits)) };
+}
+const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
+const ROLES = ['admin', 'viewer'];
+
 // constant-time string compare via SHA-256 digests
 async function safeEqual(a, b) {
   const [x, y] = await Promise.all([
@@ -136,12 +148,28 @@ async function handleLogin(request, env) {
 
   const b = await body(request);
   const username = clean(b.username, 60);
-  const password = String(b.password || '');
-  const expectedUser = env.ADMIN_USER || 'administrator';
+  // Trim surrounding whitespace/CR/LF on both sides: secrets set from a Windows
+  // terminal can pick up a stray "\r" or space that the user never sees.
+  const password = String(b.password || '').trim();
+  const expectedUser = String(env.ADMIN_USER || 'administrator').trim();
+  const expectedPass = String(env.ADMIN_PASSWORD || '').trim();
 
-  const okUser = await safeEqual(username, expectedUser);
-  const okPass = await safeEqual(password, env.ADMIN_PASSWORD);
-  const ok = okUser && okPass && password.length > 0;
+  let ok = false, role = null, loginName = username.toLowerCase();
+  if (await safeEqual(loginName, expectedUser.toLowerCase())) {
+    // built-in super-admin (password = ADMIN_PASSWORD secret)
+    ok = expectedPass.length > 0 && password.length > 0 && (await safeEqual(password, expectedPass));
+    role = 'admin';
+    loginName = expectedUser;
+  } else {
+    const u = await db.prepare('SELECT username, role, pw_salt, pw_hash, active FROM users WHERE username = ?1').bind(loginName).first();
+    if (u && u.active && password.length > 0) {
+      const h = await hashPassword(password, u.pw_salt);
+      ok = await safeEqual(h.hash, u.pw_hash);
+      role = u.role;
+    } else {
+      await hashPassword(password || 'x'); // keep timing similar for unknown users
+    }
+  }
 
   await db.prepare('INSERT INTO auth_log (username, success, ip, user_agent) VALUES (?1, ?2, ?3, ?4)').bind(username, ok ? 1 : 0, ip, ua).run();
   await db.prepare('DELETE FROM auth_log WHERE id NOT IN (SELECT id FROM auth_log ORDER BY id DESC LIMIT 200)').run();
@@ -159,8 +187,20 @@ async function handleLogin(request, env) {
 
   await db.prepare('DELETE FROM login_attempts WHERE ip = ?1').bind(ip).run();
   const expiresAt = now + TOKEN_TTL;
-  const token = await signToken({ u: expectedUser, exp: expiresAt }, env.TOKEN_SECRET);
-  return json({ token, username: expectedUser, expiresAt });
+  const token = await signToken({ u: loginName, r: role, exp: expiresAt }, env.TOKEN_SECRET);
+  return json({ token, username: loginName, role, expiresAt });
+}
+
+// Resolve the caller's current role. DB users are re-checked on every request so
+// deactivating/deleting a user or changing their role takes effect immediately.
+async function currentUser(token, env) {
+  const p = await verifyToken(token, env.TOKEN_SECRET);
+  if (!p) return null;
+  const adminName = String(env.ADMIN_USER || 'administrator').trim();
+  if (p.u === adminName) return { name: p.u, role: 'admin', builtin: true };
+  const u = await env.DB.prepare('SELECT role, active FROM users WHERE username = ?1').bind(p.u).first();
+  if (!u || !u.active) return null;
+  return { name: p.u, role: u.role, builtin: false };
 }
 
 // ---------- main router ----------
@@ -180,20 +220,80 @@ export async function onRequest(context) {
 
     // --- auth required beyond this point ---
     const auth = request.headers.get('Authorization') || '';
-    const user = await verifyToken(auth.replace(/^Bearer\s+/i, ''), env.TOKEN_SECRET);
+    const user = await currentUser(auth.replace(/^Bearer\s+/i, ''), env);
     if (!user) return err(401, 'Kailangang mag-login ulit.');
+    const isAdmin = user.role === 'admin';
 
-    // GET /api/ver
+    // GET /api/ver  (all roles)
     if (res === 'ver' && method === 'GET') return json({ ver: await getVer(db) });
 
-    // GET /api/state
+    // GET /api/state  (all roles; viewers get only the columns they may see)
     if (res === 'state' && method === 'GET') {
+      const cols = isAdmin
+        ? 'id, number, account, sim_no AS simNo, brand, status'
+        : 'id, number, account, brand, status'; // viewer: no SIM card no.
       const [sims, brands, ver] = await Promise.all([
-        db.prepare('SELECT id, number, account, sim_no AS simNo, brand, status FROM sims ORDER BY created_at, id').all(),
+        db.prepare('SELECT ' + cols + ' FROM sims ORDER BY created_at, id').all(),
         db.prepare('SELECT name FROM brands ORDER BY pos, name').all(),
         getVer(db),
       ]);
-      return json({ data: sims.results, brands: brands.results.map((b) => b.name), canEdit: true, protected: false, ver, user: user.u });
+      return json({ data: sims.results, brands: brands.results.map((b) => b.name), canEdit: isAdmin, protected: false, role: user.role, ver, user: user.name });
+    }
+
+    // ---------- everything below is admin-only ----------
+    if (!isAdmin) return err(403, 'Bawal: pang-administrator lang ito.');
+
+    // /api/users  (user management)
+    if (res === 'users') {
+      if (method === 'GET' && !id) {
+        const r = await db.prepare('SELECT username, role, active, created_at AS createdAt FROM users ORDER BY username').all();
+        return json({ users: r.results.map((u) => ({ ...u, active: !!u.active })), builtin: String(env.ADMIN_USER || 'administrator').trim() });
+      }
+      if (method === 'POST' && !id) {
+        const b = await body(request);
+        const username = clean(b.username, 32).toLowerCase();
+        const password = String(b.password || '').trim();
+        const role = ROLES.includes(b.role) ? b.role : 'viewer';
+        if (!USERNAME_RE.test(username)) return err(400, 'Username: 3-32 characters, letters/numbers/._- lang.');
+        if (username === String(env.ADMIN_USER || 'administrator').trim().toLowerCase()) return err(409, 'Reserved na ang username na iyan.');
+        if (password.length < 8) return err(400, 'Password: kahit 8 characters.');
+        const h = await hashPassword(password);
+        try {
+          await db.prepare('INSERT INTO users (username, role, pw_salt, pw_hash) VALUES (?1, ?2, ?3, ?4)').bind(username, role, h.salt, h.hash).run();
+        } catch (e) {
+          if (isUniqueErr(e)) return err(409, 'May user na ganyan ang username.');
+          throw e;
+        }
+        return json({ ok: true });
+      }
+      if (method === 'PUT' && id) {
+        const b = await body(request);
+        const name = id.toLowerCase();
+        const u = await db.prepare('SELECT username FROM users WHERE username = ?1').bind(name).first();
+        if (!u) return err(404, 'Walang ganyang user.');
+        const stmts = [];
+        if (b.role !== undefined) {
+          if (!ROLES.includes(b.role)) return err(400, 'Invalid role.');
+          stmts.push(db.prepare("UPDATE users SET role = ?2, updated_at = datetime('now') WHERE username = ?1").bind(name, b.role));
+        }
+        if (b.active !== undefined) {
+          stmts.push(db.prepare("UPDATE users SET active = ?2, updated_at = datetime('now') WHERE username = ?1").bind(name, b.active ? 1 : 0));
+        }
+        if (b.password !== undefined) {
+          const pw = String(b.password || '').trim();
+          if (pw.length < 8) return err(400, 'Password: kahit 8 characters.');
+          const h = await hashPassword(pw);
+          stmts.push(db.prepare("UPDATE users SET pw_salt = ?2, pw_hash = ?3, updated_at = datetime('now') WHERE username = ?1").bind(name, h.salt, h.hash));
+        }
+        if (!stmts.length) return err(400, 'Walang babaguhin.');
+        await db.batch(stmts);
+        return json({ ok: true });
+      }
+      if (method === 'DELETE' && id) {
+        const out = await db.prepare('DELETE FROM users WHERE username = ?1').bind(id.toLowerCase()).run();
+        if (!out.meta.changes) return err(404, 'Walang ganyang user.');
+        return json({ ok: true });
+      }
     }
 
     // GET /api/log

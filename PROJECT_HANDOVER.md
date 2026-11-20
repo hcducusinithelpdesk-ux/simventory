@@ -20,7 +20,7 @@ Sim Inventory/
 │   ├── index.html             <-- Copy of index.html that gets deployed (keep identical)
 │   └── _headers               <-- Security headers (anti-clickjacking, nosniff)
 ├── functions/api/[[route]].js <-- Server API (login + all data routes) — Pages Function
-├── schema.sql                 <-- D1 tables (sims, brands, meta, auth_log, login_attempts)
+├── schema.sql                 <-- D1 tables (sims, brands, meta, auth_log, login_attempts, users)
 ├── wrangler.toml              <-- Cloudflare config (D1 binding "DB", output dir "deploy")
 ├── package.json               <-- npm scripts + Wrangler dev dependency
 ├── .dev.vars                  <-- LOCAL ONLY test secrets (git-ignored)
@@ -44,8 +44,15 @@ Source code: https://github.com/hcducusinithelpdesk-ux/simventory
 
 ---
 
-## 4. Authentication
-- Login is verified **server-side** by `POST /api/login` against the `ADMIN_PASSWORD` secret (username `administrator`, overridable with an `ADMIN_USER` secret). No password or hash exists in the frontend.
+## 4. Authentication & Roles (RBAC)
+| Role | Can see | Can do |
+|---|---|---|
+| **Administrator** | all columns (Mobile, Account, SIM No., Brand, Status) | everything: add/edit/delete, import, export, backup/restore, print, brands, 👥 Users, 🛡️ Security log |
+| **Viewer** | Mobile No. + Account No. only | search, brand tabs, brand/status filters, sort |
+
+- Roles are enforced **by the server**: viewers get SIM No. stripped from `/api/state` and receive `403` on every write/admin route. Hiding in the UI is cosmetic only.
+- **Built-in `administrator`** is checked against the `ADMIN_PASSWORD` secret (never stored in the DB, so it can't be locked out or deleted). Username is case-insensitive; surrounding spaces in passwords are ignored.
+- **Other users** live in the D1 `users` table (PBKDF2-SHA256, 100k iterations, per-user salt). Admins manage them with the **👥 Users** button: add, change role, reset password, disable/enable, delete. Role/disable/delete take effect immediately (checked on every request).
 - Server returns an HMAC-signed token (12h). The browser keeps it in `sessionStorage` and sends `Authorization: Bearer <token>` on every API call. Closing the tab ends the session.
 - **Brute force:** 5 failed logins per IP → 5-minute lock (table `login_attempts`).
 - **Idle logout:** 15 min of no activity (warning 2 min before).
@@ -62,7 +69,9 @@ All routes need the Bearer token except login.
 | POST | `/api/login` | `{username,password}` → `{token,username,expiresAt}` |
 | GET | `/api/state` | all SIMs + brands + version |
 | GET | `/api/ver` | data version (frontend polls every 30s to auto-refresh) |
-| GET | `/api/log` | last 20 login attempts |
+| GET | `/api/log` | last 20 login attempts (admin) |
+| GET / POST | `/api/users` | list / create users (admin) |
+| PUT / DELETE | `/api/users/:username` | change role/password/active, delete (admin) |
 | POST | `/api/sims` | add SIM (409 if mobile no. or SIM no. already exists) |
 | PUT / DELETE | `/api/sims/:id` | edit / delete SIM |
 | POST | `/api/bulk` | import up to 500 SIMs (duplicates skipped) |
@@ -98,7 +107,7 @@ Older versions stored data in each browser's `localStorage`. On first login in a
 ---
 
 ## 8. Ideas for next steps
-- Multiple user accounts / roles (admin vs view-only).
+- More roles (e.g. editor: add/edit but no delete or user management).
 - Auto-deploy on GitHub push (connect repo in Cloudflare Pages or use GitHub Actions).
 - Cloudflare Access (Zero Trust) in front of the site for SSO/OTP.
 
